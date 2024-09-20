@@ -39,8 +39,8 @@ function anchor_flush_permalinks() {
 // Add a button to flush permalinks manually from the admin area
 function anchor_add_admin_page() {
     add_menu_page(
-        'Anchor Plugin',   // Page title
-        'Anchor Plugin',   // Menu title
+        'Anchor',   // Page title
+        'Anchor',   // Menu title
         'manage_options',  // Capability
         'anchor-plugin',   // Menu slug
         'anchor_admin_page',  // Callback function
@@ -52,7 +52,7 @@ add_action('admin_menu', 'anchor_add_admin_page');
 // Admin page content with a button to flush permalinks and toggle admin error reporting
 function anchor_admin_page() {
     echo '<div class="wrap">';
-    echo '<h1>Anchor Plugin Admin</h1>';
+    echo '<h1>Anchor Admin Tools</h1>';
     
     // Style buttons to be on the same line with 20px spacing
     echo '<style>
