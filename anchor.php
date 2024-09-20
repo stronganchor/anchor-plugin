@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.0.4
+ * Version: 1.0.5
  */
 
 // Exit if accessed directly.
@@ -60,7 +60,7 @@ function anchor_admin_page() {
     echo '</form>';
 
     // Debugging toggle form
-    $debug_status = defined('WP_DEBUG') && WP_DEBUG ? 'checked' : '';
+    $debug_status = get_option('anchor_debug_enabled') == '1' ? 'checked' : '';
     echo '<form method="post" action="">';
     echo '<label for="anchor_toggle_debug">';
     echo '<input type="checkbox" name="anchor_toggle_debug" value="1" ' . $debug_status . '>';
@@ -76,64 +76,47 @@ function anchor_admin_page() {
 
     // Handle WP_DEBUG toggle
     if (isset($_POST['anchor_save_debug'])) {
-        anchor_toggle_debug(isset($_POST['anchor_toggle_debug']));
+        $debug_enabled = isset($_POST['anchor_toggle_debug']) ? '1' : '0';
+        update_option('anchor_debug_enabled', $debug_enabled);
+        echo '<div class="notice notice-success"><p>WP_DEBUG has been ' . ($debug_enabled == '1' ? 'enabled' : 'disabled') . '.</p></div>';
     }
 
     echo '</div>';
 }
 
-// Function to toggle WP_DEBUG in wp-config.php
-function anchor_toggle_debug($enable_debug) {
-    $wp_config_path = ABSPATH . 'wp-config.php';
-
-    if (is_writable($wp_config_path)) {
-        $config_file = file_get_contents($wp_config_path);
-
-        // Ensure WP_DEBUG is defined and modify its value
-        if (strpos($config_file, "define('WP_DEBUG'") !== false) {
-            // Update existing WP_DEBUG definition
-            $config_file = preg_replace(
-                "/define\('WP_DEBUG', (true|false)\);/i",
-                "define('WP_DEBUG', " . ($enable_debug ? 'true' : 'false') . ");",
-                $config_file
-            );
-        } else {
-            // Add WP_DEBUG definition if not found
-            $config_file = str_replace("/* That's all, stop editing!", "define('WP_DEBUG', " . ($enable_debug ? 'true' : 'false') . ");\n/* That's all, stop editing!", $config_file);
-        }
-
-        // Write the modified config file back
-        file_put_contents($wp_config_path, $config_file);
-
-        echo '<div class="notice notice-success"><p>WP_DEBUG has been ' . ($enable_debug ? 'enabled' : 'disabled') . '.</p></div>';
-    } else {
-        echo '<div class="notice notice-error"><p>Error: Unable to write to wp-config.php.</p></div>';
-    }
-}
-
-// ** Show errors only to logged-in admins **
-function anchor_show_errors_to_admins() {
-    if (defined('WP_DEBUG') && WP_DEBUG) {
+// ** Dynamically set WP_DEBUG based on option in the database **
+function anchor_set_debug_mode() {
+    if (get_option('anchor_debug_enabled') == '1') {
+        define('WP_DEBUG', true);
+        define('WP_DEBUG_LOG', true);
+        define('WP_DEBUG_DISPLAY', false);  // Set false to avoid public display of errors
+        
+        // Show errors to admin users only
         if (current_user_can('administrator') && is_user_logged_in()) {
             @ini_set('display_errors', 1);
             define('WP_DEBUG_DISPLAY', true);
         } else {
             @ini_set('display_errors', 0);
-            define('WP_DEBUG_DISPLAY', false);
         }
+    } else {
+        define('WP_DEBUG', false);
     }
 }
-add_action('init', 'anchor_show_errors_to_admins');
+add_action('init', 'anchor_set_debug_mode');
 
 // ** Flush permalinks on plugin activation and deactivation **
 function anchor_activate() {
     // Flush permalinks on activation
     flush_rewrite_rules(true);
+    // Set the default for WP_DEBUG to disabled
+    update_option('anchor_debug_enabled', '0');
 }
 register_activation_hook(__FILE__, 'anchor_activate');
 
 function anchor_deactivate() {
     // Flush permalinks on deactivation
     flush_rewrite_rules(true);
+    // Optionally remove the debug option if you want
+    delete_option('anchor_debug_enabled');
 }
 register_deactivation_hook(__FILE__, 'anchor_deactivate');
