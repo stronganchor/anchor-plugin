@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.0.5
+ * Version: 1.0.7
  */
 
 // Exit if accessed directly.
@@ -49,7 +49,7 @@ function anchor_add_admin_page() {
 }
 add_action('admin_menu', 'anchor_add_admin_page');
 
-// Admin page content with a button to flush permalinks and toggle WP_DEBUG
+// Admin page content with a button to flush permalinks and toggle admin error reporting
 function anchor_admin_page() {
     echo '<div class="wrap">';
     echo '<h1>Anchor Plugin Admin</h1>';
@@ -59,14 +59,14 @@ function anchor_admin_page() {
     echo '<input type="submit" name="anchor_flush_permalinks" class="button button-primary" value="Flush Permalinks Now">';
     echo '</form>';
 
-    // Debugging toggle form
-    $debug_status = get_option('anchor_debug_enabled') == '1' ? 'checked' : '';
+    // Error reporting toggle form
+    $error_reporting_status = get_option('anchor_error_reporting_enabled') == '1' ? 'checked' : '';
     echo '<form method="post" action="">';
-    echo '<label for="anchor_toggle_debug">';
-    echo '<input type="checkbox" name="anchor_toggle_debug" value="1" ' . $debug_status . '>';
-    echo ' Enable WP_DEBUG';
+    echo '<label for="anchor_toggle_error_reporting">';
+    echo '<input type="checkbox" name="anchor_toggle_error_reporting" value="1" ' . $error_reporting_status . '>';
+    echo ' Enable error reporting for administrators';
     echo '</label>';
-    echo '<br><input type="submit" name="anchor_save_debug" class="button button-primary" value="Save Debug Settings">';
+    echo '<br><input type="submit" name="anchor_save_error_reporting" class="button button-primary" value="Save Error Reporting Settings">';
     echo '</form>';
 
     // Handle permalink flush
@@ -74,49 +74,49 @@ function anchor_admin_page() {
         anchor_flush_permalinks();  // Trigger permalink flush
     }
 
-    // Handle WP_DEBUG toggle
-    if (isset($_POST['anchor_save_debug'])) {
-        $debug_enabled = isset($_POST['anchor_toggle_debug']) ? '1' : '0';
-        update_option('anchor_debug_enabled', $debug_enabled);
-        echo '<div class="notice notice-success"><p>WP_DEBUG has been ' . ($debug_enabled == '1' ? 'enabled' : 'disabled') . '.</p></div>';
+    // Handle error reporting toggle
+    if (isset($_POST['anchor_save_error_reporting'])) {
+        $error_reporting_enabled = isset($_POST['anchor_toggle_error_reporting']) ? '1' : '0';
+        update_option('anchor_error_reporting_enabled', $error_reporting_enabled);
+        echo '<div class="notice notice-success"><p>Error reporting has been ' . ($error_reporting_enabled == '1' ? 'enabled' : 'disabled') . ' for admins.</p></div>';
     }
 
     echo '</div>';
 }
 
-// ** Dynamically set WP_DEBUG based on option in the database **
-function anchor_set_debug_mode() {
-    if (get_option('anchor_debug_enabled') == '1') {
-        define('WP_DEBUG', true);
-        define('WP_DEBUG_LOG', true);
-        define('WP_DEBUG_DISPLAY', false);  // Set false to avoid public display of errors
-        
-        // Show errors to admin users only
+// ** Dynamically control error reporting for admins **
+function anchor_set_error_reporting() {
+    if (get_option('anchor_error_reporting_enabled') == '1') {
         if (current_user_can('administrator') && is_user_logged_in()) {
+            // Enable error reporting for admins
+            error_reporting(E_ALL);  // Report all PHP errors
             @ini_set('display_errors', 1);
-            define('WP_DEBUG_DISPLAY', true);
         } else {
+            // Disable error reporting for non-admins or non-logged-in users
+            error_reporting(0);
             @ini_set('display_errors', 0);
         }
     } else {
-        define('WP_DEBUG', false);
+        // Ensure no errors are shown if the setting is disabled
+        error_reporting(0);
+        @ini_set('display_errors', 0);
     }
 }
-add_action('init', 'anchor_set_debug_mode');
+add_action('init', 'anchor_set_error_reporting');
 
 // ** Flush permalinks on plugin activation and deactivation **
 function anchor_activate() {
     // Flush permalinks on activation
     flush_rewrite_rules(true);
-    // Set the default for WP_DEBUG to disabled
-    update_option('anchor_debug_enabled', '0');
+    // Set the default for error reporting to disabled
+    update_option('anchor_error_reporting_enabled', '0');
 }
 register_activation_hook(__FILE__, 'anchor_activate');
 
 function anchor_deactivate() {
     // Flush permalinks on deactivation
     flush_rewrite_rules(true);
-    // Optionally remove the debug option if you want
-    delete_option('anchor_debug_enabled');
+    // Optionally remove the error reporting option if you want
+    delete_option('anchor_error_reporting_enabled');
 }
 register_deactivation_hook(__FILE__, 'anchor_deactivate');
