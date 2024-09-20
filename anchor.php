@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.0.8
+ * Version: 1.0.9
  */
 
 // Exit if accessed directly.
@@ -44,7 +44,7 @@ function anchor_add_admin_page() {
         'manage_options',  // Capability
         'anchor-plugin',   // Menu slug
         'anchor_admin_page',  // Callback function
-        'dashicons-admin-generic'  // Icon
+        'dashicons-admin-site-alt3'  // Icon (closest available to a sea anchor)
     );
 }
 add_action('admin_menu', 'anchor_add_admin_page');
@@ -53,6 +53,16 @@ add_action('admin_menu', 'anchor_add_admin_page');
 function anchor_admin_page() {
     echo '<div class="wrap">';
     echo '<h1>Anchor Plugin Admin</h1>';
+    
+    // Style buttons to be on the same line with 20px spacing
+    echo '<style>
+        .anchor-button-wrapper form {
+            display: inline-block;
+            margin-right: 20px;
+        }
+    </style>';
+    
+    echo '<div class="anchor-button-wrapper">';
     
     // Permalink flush form
     echo '<form method="post" action="">';
@@ -65,6 +75,8 @@ function anchor_admin_page() {
     echo '<form method="post" action="">';
     echo '<input type="submit" name="anchor_toggle_error_reporting" class="button button-primary" value="' . $button_label . '">';
     echo '</form>';
+    
+    echo '</div>';  // End button wrapper
 
     // Handle permalink flush
     if (isset($_POST['anchor_flush_permalinks'])) {
