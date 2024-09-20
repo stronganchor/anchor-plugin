@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.0.7
+ * Version: 1.0.8
  */
 
 // Exit if accessed directly.
@@ -59,14 +59,11 @@ function anchor_admin_page() {
     echo '<input type="submit" name="anchor_flush_permalinks" class="button button-primary" value="Flush Permalinks Now">';
     echo '</form>';
 
-    // Error reporting toggle form
-    $error_reporting_status = get_option('anchor_error_reporting_enabled') == '1' ? 'checked' : '';
+    // Error reporting toggle button
+    $error_reporting_enabled = get_option('anchor_error_reporting_enabled') == '1';
+    $button_label = $error_reporting_enabled ? 'Disable Error Reporting for Admins' : 'Enable Error Reporting for Admins';
     echo '<form method="post" action="">';
-    echo '<label for="anchor_toggle_error_reporting">';
-    echo '<input type="checkbox" name="anchor_toggle_error_reporting" value="1" ' . $error_reporting_status . '>';
-    echo ' Enable error reporting for administrators';
-    echo '</label>';
-    echo '<br><input type="submit" name="anchor_save_error_reporting" class="button button-primary" value="Save Error Reporting Settings">';
+    echo '<input type="submit" name="anchor_toggle_error_reporting" class="button button-primary" value="' . $button_label . '">';
     echo '</form>';
 
     // Handle permalink flush
@@ -75,20 +72,20 @@ function anchor_admin_page() {
     }
 
     // Handle error reporting toggle
-    if (isset($_POST['anchor_save_error_reporting'])) {
-        $error_reporting_enabled = isset($_POST['anchor_toggle_error_reporting']) ? '1' : '0';
-        update_option('anchor_error_reporting_enabled', $error_reporting_enabled);
-        echo '<div class="notice notice-success"><p>Error reporting has been ' . ($error_reporting_enabled == '1' ? 'enabled' : 'disabled') . ' for admins.</p></div>';
+    if (isset($_POST['anchor_toggle_error_reporting'])) {
+        $new_status = $error_reporting_enabled ? '0' : '1';
+        update_option('anchor_error_reporting_enabled', $new_status);
+        echo '<div class="notice notice-success"><p>Error reporting has been ' . ($new_status == '1' ? 'enabled' : 'disabled') . ' for admins.</p></div>';
     }
 
     echo '</div>';
 }
 
-// ** Dynamically control error reporting for admins **
+// ** Dynamically control error reporting for admins (on both frontend and admin dashboard) **
 function anchor_set_error_reporting() {
     if (get_option('anchor_error_reporting_enabled') == '1') {
         if (current_user_can('administrator') && is_user_logged_in()) {
-            // Enable error reporting for admins
+            // Enable error reporting for admins (both frontend and dashboard)
             error_reporting(E_ALL);  // Report all PHP errors
             @ini_set('display_errors', 1);
         } else {
