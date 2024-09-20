@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.0.2
+ * Version: 1.0.3
  */
 
 // Exit if accessed directly.
@@ -18,8 +18,8 @@ use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
 
 $myUpdateChecker = PucFactory::buildUpdateChecker(
     'https://github.com/stronganchor/anchor-plugin', // GitHub repository URL
-    __FILE__,                                                  // Full path to the main plugin file
-    'anchor-plugin'                                   // Plugin slug
+    __FILE__,                                        // Full path to the main plugin file
+    'anchor-plugin'                                  // Plugin slug
 );
 
 // Set the branch to "main"
@@ -27,7 +27,6 @@ $myUpdateChecker->setBranch('main');
 
 // Optional: If you're using a private repository, specify the access token like this:
 // $myUpdateChecker->setAuthentication('your-token-here');
-
 
 // ** Permalink Flushing Functionality **
 
@@ -66,3 +65,16 @@ function anchor_admin_page() {
     
     echo '</div>';
 }
+
+// ** Flush permalinks on plugin activation and deactivation **
+function anchor_activate() {
+    // Flush permalinks on activation
+    flush_rewrite_rules(true);
+}
+register_activation_hook(__FILE__, 'anchor_activate');
+
+function anchor_deactivate() {
+    // Flush permalinks on deactivation
+    flush_rewrite_rules(true);
+}
+register_deactivation_hook(__FILE__, 'anchor_deactivate');
