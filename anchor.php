@@ -200,68 +200,75 @@ function anchor_disable_pings_apply() {
 add_action( 'init', 'anchor_disable_pings_apply' );
 
 // -----------------------------------------------------------------------------
-// ** Duplicator Pro: Disable Weekly Email Summaries **
+// Anchor → Force‑disable Duplicator Pro Email Summaries
 // -----------------------------------------------------------------------------
 
-/**
- * Disable Duplicator Pro weekly email summaries:
- * - Clears the WP‑Cron event that sends the summary.
- * - Sets the Duplicator Pro "Email Summary → Frequency" to "never" in the options.
- */
-function anchor_disable_duplicator_email_summary() {
-    // Only run if Duplicator Pro is loaded
+add_action( 'admin_init', 'anchor_force_disable_duplicator_summaries', 1 );
+function anchor_force_disable_duplicator_summaries() {
+    // Only if Duplicator Pro is active
     if ( defined( 'DUPLICATOR_PRO_VERSION' ) ) {
-        // 1) Unschedule the weekly summary event
-        wp_clear_scheduled_hook( 'duplicator_weekly_summary' );
 
-        // 2) Update the Duplicator Pro settings to disable summaries
-        $option_name = 'duplicator_options';  // core settings array for Pro
-        $opts = get_option( $option_name, array() );
-
-        // Ensure the email_summary key exists
-        if ( ! isset( $opts['email_summary'] ) || ! is_array( $opts['email_summary'] ) ) {
-            $opts['email_summary'] = array();
+        // 1) If the settings form is submitting a frequency, force it to 'never'
+        if ( isset( $_REQUEST['_email_summary_frequency'] ) ) {
+            $_REQUEST['_email_summary_frequency'] = 'never';
+            $_POST   ['_email_summary_frequency'] = 'never';
         }
 
-        // Set frequency to 'never' (matches the UI choice: Settings » Email Summary » Frequency » Never)
-        $opts['email_summary']['frequency'] = 'never';
+        // 2) Clear any scheduled weekly summary
+        wp_clear_scheduled_hook( 'duplicator_weekly_summary' );
 
-        update_option( $option_name, $opts );
+        // 3) Persist "never" in the stored options
+        $keys = array(
+            'duplicator_options',
+            'duplicator_settings',
+            'duplicator_pro_settings',
+        );
+
+        foreach ( $keys as $opt_name ) {
+            $opts = get_option( $opt_name, array() );
+            if ( ! is_array( $opts ) ) {
+                continue;
+            }
+            if ( empty( $opts['email_summary'] ) || ! is_array( $opts['email_summary'] ) ) {
+                $opts['email_summary'] = array();
+            }
+            $opts['email_summary']['frequency'] = EmailSummary::SEND_FREQ_NEVER; // 'never'
+            update_option( $opt_name, $opts );
+        }
     }
 }
-
-/**
- * Hook into Anchor activation to disable Duplicator summaries immediately.
- */
-register_activation_hook( __FILE__, 'anchor_disable_duplicator_email_summary' );
-
-/**
- * Hook into the WP upgrader so that if Anchor itself is updated,
- * we re‑disable the summary one time after the upgrade completes.
- */
-add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
-    if (
-        isset( $hook_data['action'], $hook_data['type'], $hook_data['plugins'] )
-        && $hook_data['action'] === 'update'
-        && $hook_data['type']   === 'plugin'
-        && in_array( plugin_basename( __FILE__ ), (array) $hook_data['plugins'], true )
-    ) {
-        anchor_disable_duplicator_email_summary();
-    }
-}, 10, 2 );
 
 // -----------------------------------------------------------------------------
 // ** Activation & Deactivation Hooks **
 // -----------------------------------------------------------------------------
 
+/**
+ * On plugin activation: clear cron and force “never” for Duplicator Pro summaries.
+ */
 function anchor_activate() {
-    // Flush permalinks when activating
+    // Flush permalinks
     flush_rewrite_rules( true );
-    // Ensure both features default to “off”
+    // Disable any Duplicator Pro weekly summary immediately
+    anchor_force_disable_duplicator_summaries();
+    // Default our own features off
     update_option( 'anchor_error_reporting_enabled', '0' );
-    update_option( 'anchor_disable_pings_enabled', '0' );
+    update_option( 'anchor_disable_pings_enabled',   '0' );
 }
 register_activation_hook( __FILE__, 'anchor_activate' );
+
+/**
+ * On Anchor plugin upgrade: rerun the disable routine so you don’t have to visit wp‑admin.
+ */
+add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
+    if (
+        isset( $hook_data['action'], $hook_data['type'], $hook_data['plugins'] )
+        && $hook_data['action']  === 'update'
+        && $hook_data['type']    === 'plugin'
+        && in_array( plugin_basename( __FILE__ ), (array) $hook_data['plugins'], true )
+    ) {
+        anchor_force_disable_duplicator_summaries();
+    }
+}, 10, 2 );
 
 function anchor_deactivate() {
     // Flush permalinks again when deactivating
