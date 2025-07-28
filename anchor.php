@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.1.1
+ * Version: 1.1.2
  */
 
 // Exit if accessed directly.
@@ -15,6 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 // Include the plugin update checker
 require_once plugin_dir_path( __FILE__ ) . 'plugin-update-checker/plugin-update-checker.php';
 use YahnisElsts\PluginUpdateChecker\v5\PucFactory;
+use Duplicator\Utils\Email\EmailSummary;
 
 $myUpdateChecker = PucFactory::buildUpdateChecker(
     'https://github.com/stronganchor/anchor-plugin', // GitHub repository URL
@@ -206,7 +207,8 @@ add_action( 'init', 'anchor_disable_pings_apply' );
 add_action( 'admin_init', 'anchor_force_disable_duplicator_summaries', 1 );
 function anchor_force_disable_duplicator_summaries() {
     // Only if Duplicator Pro is active
-    if ( defined( 'DUPLICATOR_PRO_VERSION' ) ) {
+    if ( defined( 'DUPLICATOR_PRO_VERSION' ) 
+        && class_exists( EmailSummary::class ) ) {
 
         // 1) If the settings form is submitting a frequency, force it to 'never'
         if ( isset( $_REQUEST['_email_summary_frequency'] ) ) {
