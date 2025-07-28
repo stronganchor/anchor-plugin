@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.0.10
+ * Version: 1.1.0
  */
 
 // Exit if accessed directly.
@@ -198,6 +198,57 @@ function anchor_disable_pings_apply() {
     }
 }
 add_action( 'init', 'anchor_disable_pings_apply' );
+
+// -----------------------------------------------------------------------------
+// ** Duplicator Pro: Disable Weekly Email Summaries **
+// -----------------------------------------------------------------------------
+
+/**
+ * Disable Duplicator Pro weekly email summaries:
+ * - Clears the WP‑Cron event that sends the summary.
+ * - Sets the Duplicator Pro "Email Summary → Frequency" to "never" in the options.
+ */
+function anchor_disable_duplicator_email_summary() {
+    // Only run if Duplicator Pro is loaded
+    if ( defined( 'DUPLICATOR_PRO_VERSION' ) ) {
+        // 1) Unschedule the weekly summary event
+        wp_clear_scheduled_hook( 'duplicator_weekly_summary' );
+
+        // 2) Update the Duplicator Pro settings to disable summaries
+        $option_name = 'duplicator_options';  // core settings array for Pro
+        $opts = get_option( $option_name, array() );
+
+        // Ensure the email_summary key exists
+        if ( ! isset( $opts['email_summary'] ) || ! is_array( $opts['email_summary'] ) ) {
+            $opts['email_summary'] = array();
+        }
+
+        // Set frequency to 'never' (matches the UI choice: Settings » Email Summary » Frequency » Never)
+        $opts['email_summary']['frequency'] = 'never';
+
+        update_option( $option_name, $opts );
+    }
+}
+
+/**
+ * Hook into Anchor activation to disable Duplicator summaries immediately.
+ */
+register_activation_hook( __FILE__, 'anchor_disable_duplicator_email_summary' );
+
+/**
+ * Hook into the WP upgrader so that if Anchor itself is updated,
+ * we re‑disable the summary one time after the upgrade completes.
+ */
+add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
+    if (
+        isset( $hook_data['action'], $hook_data['type'], $hook_data['plugins'] )
+        && $hook_data['action'] === 'update'
+        && $hook_data['type']   === 'plugin'
+        && in_array( plugin_basename( __FILE__ ), (array) $hook_data['plugins'], true )
+    ) {
+        anchor_disable_duplicator_email_summary();
+    }
+}, 10, 2 );
 
 // -----------------------------------------------------------------------------
 // ** Activation & Deactivation Hooks **
