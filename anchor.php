@@ -23,6 +23,11 @@ $myUpdateChecker = PucFactory::buildUpdateChecker(
     'anchor-plugin'                                   // Plugin slug
 );
 
+// If the site has defined ANCHOR_GITHUB_TOKEN, use it to authenticate:
+if ( defined( 'ANCHOR_GITHUB_TOKEN' ) && ANCHOR_GITHUB_TOKEN ) {
+    $myUpdateChecker->setAuthentication( ANCHOR_GITHUB_TOKEN );
+}
+
 // Set the branch to "main"
 $myUpdateChecker->setBranch( 'main' );
 
