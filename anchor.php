@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.1.2
+ * Version: 1.1.3
  */
 
 // Exit if accessed directly.
@@ -200,45 +200,38 @@ function anchor_disable_pings_apply() {
 }
 add_action( 'init', 'anchor_disable_pings_apply' );
 
-// -----------------------------------------------------------------------------
-// Anchor → Force‑disable Duplicator Pro Email Summaries
-// -----------------------------------------------------------------------------
-
-add_action( 'admin_init', 'anchor_force_disable_duplicator_summaries', 1 );
+/**
+ * Force‐disable Duplicator Pro email summaries:
+ *  - Overrides any submitted frequency to "never"
+ *  - Clears the scheduled cron
+ *  - Persists "never" via the Global Entity (SnapIO)
+ */
 function anchor_force_disable_duplicator_summaries() {
-    // Only if Duplicator Pro is active
-    if ( defined( 'DUPLICATOR_PRO_VERSION' ) 
-        && class_exists( EmailSummary::class ) ) {
-
-        // 1) If the settings form is submitting a frequency, force it to 'never'
-        if ( isset( $_REQUEST['_email_summary_frequency'] ) ) {
-            $_REQUEST['_email_summary_frequency'] = 'never';
-            $_POST   ['_email_summary_frequency'] = 'never';
-        }
-
-        // 2) Clear any scheduled weekly summary
-        wp_clear_scheduled_hook( 'duplicator_weekly_summary' );
-
-        // 3) Persist "never" in the stored options
-        $keys = array(
-            'duplicator_options',
-            'duplicator_settings',
-            'duplicator_pro_settings',
-        );
-
-        foreach ( $keys as $opt_name ) {
-            $opts = get_option( $opt_name, array() );
-            if ( ! is_array( $opts ) ) {
-                continue;
-            }
-            if ( empty( $opts['email_summary'] ) || ! is_array( $opts['email_summary'] ) ) {
-                $opts['email_summary'] = array();
-            }
-            $opts['email_summary']['frequency'] = EmailSummary::SEND_FREQ_NEVER; // 'never'
-            update_option( $opt_name, $opts );
-        }
+    // Bail if Duplicator Pro isn’t loaded or the classes aren’t available
+    if (
+        ! defined( 'DUPLICATOR_PRO_VERSION' )
+        || ! class_exists( EmailSummary::class )
+        || ! class_exists( 'DUP_PRO_Global_Entity' )
+    ) {
+        return;
     }
+
+    // 1) If the Settings page is submitting a frequency, force it to 'never'
+    if ( isset( $_REQUEST['_email_summary_frequency'] ) ) {
+        $_REQUEST['_email_summary_frequency'] = EmailSummary::SEND_FREQ_NEVER;
+        $_POST   ['_email_summary_frequency'] = EmailSummary::SEND_FREQ_NEVER;
+    }
+
+    // 2) Unschedule any pending summary email
+    wp_clear_scheduled_hook( 'duplicator_weekly_summary' );
+
+    // 3) Programmatically set + save "never" in Duplicator Pro’s Global Entity
+    /** @var \DUP_PRO_Global_Entity $global */
+    $global = \DUP_PRO_Global_Entity::getInstance();
+    $global->setEmailSummaryFrequency( EmailSummary::SEND_FREQ_NEVER );
+    $global->save();
 }
+add_action( 'admin_init', 'anchor_force_disable_duplicator_summaries', 1 );
 
 // -----------------------------------------------------------------------------
 // ** Activation & Deactivation Hooks **
