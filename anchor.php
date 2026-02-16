@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.1.5
+ * Version: 1.1.6
  */
 
 // Exit if accessed directly.
@@ -32,7 +32,7 @@ if ( defined( 'ANCHOR_GITHUB_TOKEN' ) && ANCHOR_GITHUB_TOKEN ) {
 $myUpdateChecker->setBranch( 'main' );
 
 // -----------------------------------------------------------------------------
-// ** Wordfence Scan Cron Staggering **
+// ** Wordfence Scan Cron Staggering (with dedupe) **
 // -----------------------------------------------------------------------------
 // Goal: prevent many sites on the same server from running Wordfence scans at the same time.
 // Works by detecting likely Wordfence scan cron hooks and rescheduling them to a deterministic,
@@ -41,7 +41,7 @@ $myUpdateChecker->setBranch( 'main' );
 // Notes:
 // - Wordfence free uses WP-Cron to schedule scans; hook names can vary by version.
 // - We do best-effort hook detection (no hard dependency on one name).
-// - We preserve the existing recurrence schedule + args when rescheduling.
+// - We dedupe: after staggering, we ensure only ONE future event remains per scan hook.
 // - If we can't detect a hook, we do nothing.
 
 function anchor_wf_is_enabled() {
@@ -121,14 +121,12 @@ function anchor_wf_find_scan_cron_events() {
  * We spread sites across a 6-hour window to reduce herd effects.
  */
 function anchor_wf_compute_target_timestamp() {
-    // Base local time for scans: 03:00 tomorrow (site timezone for wp_date; server uses PHP tz).
+    // Base local time for scans: 03:00 tomorrow (server/PHP timezone).
     // Offset: 0..359 minutes (6 hours).
     $home = home_url();
     $hash = sprintf( '%u', crc32( $home ) ); // unsigned
     $offset_minutes = (int) ( $hash % 360 );
 
-    // "tomorrow 03:00" in server/PHP timezone; on most WHM servers this matches expected local server time.
-    // Using strtotime is OK here; goal is stagger, not perfect TZ correctness across DST boundaries.
     $base = strtotime( 'tomorrow 03:00' );
     if ( ! $base ) {
         $base = time() + DAY_IN_SECONDS;
@@ -139,15 +137,13 @@ function anchor_wf_compute_target_timestamp() {
 
 /**
  * Reschedule detected Wordfence scan cron events to the per-site stagger time.
+ * Dedupe: after this runs, there should be only ONE future event per detected scan hook.
  */
 function anchor_wf_stagger_scan_cron( $force = false ) {
     if ( ! anchor_wf_is_enabled() ) {
         return;
     }
 
-    // Only try if Wordfence is active-ish.
-    // Free/Premium both define WORDFENCE_VERSION, but if not present we still attempt detection.
-    // This remains a no-op if no hooks found.
     $events = anchor_wf_find_scan_cron_events();
     if ( empty( $events ) ) {
         return;
@@ -166,48 +162,42 @@ function anchor_wf_stagger_scan_cron( $force = false ) {
         $target = (int) ( $target + DAY_IN_SECONDS );
     }
 
-    // Reschedule each detected scan event.
-    // Preserve schedule + args; only move the timestamp.
+    // Group by hook. Keep args from the earliest event for that hook.
+    $by_hook = array();
     foreach ( $events as $e ) {
-        $hook      = $e['hook'];
-        $timestamp = (int) $e['timestamp'];
-        $args      = $e['args'];
-        $schedule  = $e['schedule'];
+        $hook = $e['hook'];
+        if ( ! isset( $by_hook[ $hook ] ) ) {
+            $by_hook[ $hook ] = array(
+                'keep_args'     => $e['args'],
+                'keep_schedule' => $e['schedule'], // usually null (single)
+            );
+        }
+    }
 
-        // If already close enough to target (within 10 minutes), skip.
-        if ( abs( $timestamp - $target ) <= 600 ) {
-            continue;
+    foreach ( $by_hook as $hook => $data ) {
+        // Remove ALL future instances of this hook (any args).
+        while ( $t = wp_next_scheduled( $hook ) ) {
+            wp_unschedule_event( $t, $hook ); // removes one instance; loop clears all
         }
 
-        // Remove existing
-        wp_unschedule_event( $timestamp, $hook, $args );
+        // Schedule exactly one scan-start event at the target time.
+        $args = isset( $data['keep_args'] ) && is_array( $data['keep_args'] ) ? $data['keep_args'] : array();
 
-        // Add back at staggered time preserving recurrence when possible.
-        if ( $schedule ) {
-            wp_schedule_event( $target, $schedule, $hook, $args );
-        } else {
-            wp_schedule_single_event( $target, $hook, $args );
-        }
+        // Most Wordfence scan-start hooks are single events. Keep it single to match observed behavior.
+        wp_schedule_single_event( $target, $hook, $args );
     }
 
     update_option( 'anchor_wf_stagger_last_reschedule', time(), false );
 }
 
 /**
- * Provide admin-readable info: next detected WF scan cron event (if any).
+ * Provide admin-readable info: detected WF scan cron events (if any) + target.
  */
 function anchor_wf_get_next_scan_event_info() {
     $events = anchor_wf_find_scan_cron_events();
-    if ( empty( $events ) ) {
-        return array(
-            'found'   => false,
-            'events'  => array(),
-            'target'  => anchor_wf_compute_target_timestamp(),
-        );
-    }
 
     return array(
-        'found'  => true,
+        'found'  => ! empty( $events ),
         'events' => $events,
         'target' => anchor_wf_compute_target_timestamp(),
     );
@@ -407,6 +397,8 @@ function anchor_admin_page() {
         if ( count( $info['events'] ) > 10 ) {
             echo '<p><em>Showing first 10 detected events.</em></p>';
         }
+
+        echo '<p style="max-width: 1100px;"><em>After staggering runs, there should be only one scheduled scan-start event per hook. If you still see duplicates, click “Apply Staggering Now” once.</em></p>';
     }
 
     $last = (int) get_option( 'anchor_wf_stagger_last_reschedule', 0 );
@@ -553,7 +545,7 @@ function anchor_activate() {
         update_option( 'anchor_wf_stagger_enabled', '1', false );
     }
 
-    // Attempt immediate best-effort stagger
+    // Attempt immediate best-effort stagger (and dedupe)
     anchor_wf_stagger_scan_cron( true );
 }
 register_activation_hook( __FILE__, 'anchor_activate' );
