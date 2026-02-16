@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.1.6
+ * Version: 1.1.7
  */
 
 // Exit if accessed directly.
@@ -32,36 +32,18 @@ if ( defined( 'ANCHOR_GITHUB_TOKEN' ) && ANCHOR_GITHUB_TOKEN ) {
 $myUpdateChecker->setBranch( 'main' );
 
 // -----------------------------------------------------------------------------
-// ** Wordfence Scan Cron Staggering (with dedupe) **
+// ** Wordfence Scan Cron Staggering (with real dedupe) **
 // -----------------------------------------------------------------------------
-// Goal: prevent many sites on the same server from running Wordfence scans at the same time.
-// Works by detecting likely Wordfence scan cron hooks and rescheduling them to a deterministic,
-// per-site time window (stable across requests) to spread load.
-//
-// Notes:
-// - Wordfence free uses WP-Cron to schedule scans; hook names can vary by version.
-// - We do best-effort hook detection (no hard dependency on one name).
-// - We dedupe: after staggering, we ensure only ONE future event remains per scan hook.
-// - If we can't detect a hook, we do nothing.
+// Why you still saw two events: wp_unschedule_event()/wp_next_scheduled() require matching args.
+// Wordfence schedules the same hook multiple times with different args, so we must remove each
+// instance by scanning the cron array and unscheduling with the exact args.
 
 function anchor_wf_is_enabled() {
-    // Default ON once deployed, but safe if Wordfence isn't installed (no-op).
     return get_option( 'anchor_wf_stagger_enabled', '1' ) === '1';
 }
 
 /**
  * Find likely Wordfence scan-related cron events.
- *
- * Returns array of:
- * [
- *   [
- *     'hook' => string,
- *     'timestamp' => int,
- *     'schedule' => string|null,
- *     'args' => array,
- *   ],
- *   ...
- * ]
  */
 function anchor_wf_find_scan_cron_events() {
     $cron = _get_cron_array();
@@ -83,10 +65,7 @@ function anchor_wf_find_scan_cron_events() {
 
             $hook_lc = strtolower( (string) $hook );
 
-            // Heuristic detection:
-            // - Must mention wordfence or wf
-            // - Prefer hooks that mention scan
-            // This avoids catching unrelated WF cron tasks.
+            // Must mention wordfence or wf, and scan
             $looks_like_wordfence = ( strpos( $hook_lc, 'wordfence' ) !== false || preg_match( '/\bwf\b/', $hook_lc ) );
             $looks_like_scan      = ( strpos( $hook_lc, 'scan' ) !== false );
 
@@ -108,7 +87,6 @@ function anchor_wf_find_scan_cron_events() {
         }
     }
 
-    // Sort by next run time ascending
     usort( $events, function( $a, $b ) {
         return (int) $a['timestamp'] <=> (int) $b['timestamp'];
     } );
@@ -117,12 +95,41 @@ function anchor_wf_find_scan_cron_events() {
 }
 
 /**
- * Compute a deterministic target timestamp (server/site time) for "tomorrow at base + offset".
- * We spread sites across a 6-hour window to reduce herd effects.
+ * Remove ALL cron instances for a given hook, regardless of args.
+ * Returns number removed.
+ */
+function anchor_cron_remove_all_instances_for_hook( $hook ) {
+    $cron = _get_cron_array();
+    if ( empty( $cron ) || ! is_array( $cron ) ) {
+        return 0;
+    }
+
+    $removed = 0;
+
+    foreach ( $cron as $timestamp => $hooks ) {
+        if ( empty( $hooks[ $hook ] ) || ! is_array( $hooks[ $hook ] ) ) {
+            continue;
+        }
+
+        foreach ( $hooks[ $hook ] as $sig => $data ) {
+            $args = isset( $data['args'] ) && is_array( $data['args'] ) ? $data['args'] : array();
+            // Unschedule the exact instance (timestamp + hook + args)
+            if ( wp_unschedule_event( (int) $timestamp, $hook, $args ) ) {
+                $removed++;
+            } else {
+                // Even if wp_unschedule_event returns false, try again defensively (rare edge cases)
+                wp_unschedule_event( (int) $timestamp, $hook, $args );
+            }
+        }
+    }
+
+    return $removed;
+}
+
+/**
+ * Compute deterministic stagger target: tomorrow 03:00 + 0..359 minutes.
  */
 function anchor_wf_compute_target_timestamp() {
-    // Base local time for scans: 03:00 tomorrow (server/PHP timezone).
-    // Offset: 0..359 minutes (6 hours).
     $home = home_url();
     $hash = sprintf( '%u', crc32( $home ) ); // unsigned
     $offset_minutes = (int) ( $hash % 360 );
@@ -137,7 +144,7 @@ function anchor_wf_compute_target_timestamp() {
 
 /**
  * Reschedule detected Wordfence scan cron events to the per-site stagger time.
- * Dedupe: after this runs, there should be only ONE future event per detected scan hook.
+ * Ensures only ONE future event per scan hook.
  */
 function anchor_wf_stagger_scan_cron( $force = false ) {
     if ( ! anchor_wf_is_enabled() ) {
@@ -149,20 +156,17 @@ function anchor_wf_stagger_scan_cron( $force = false ) {
         return;
     }
 
-    // Avoid rescheduling on every request. Do it at most once every ~20 hours unless forced.
     $last = (int) get_option( 'anchor_wf_stagger_last_reschedule', 0 );
     if ( ! $force && $last > 0 && ( time() - $last ) < ( 20 * HOUR_IN_SECONDS ) ) {
         return;
     }
 
     $target = anchor_wf_compute_target_timestamp();
-
-    // If target already passed today due to clock oddities, push to next day.
     if ( $target <= time() + 60 ) {
         $target = (int) ( $target + DAY_IN_SECONDS );
     }
 
-    // Group by hook. Keep args from the earliest event for that hook.
+    // Group by hook, keep args from the earliest event for that hook
     $by_hook = array();
     foreach ( $events as $e ) {
         $hook = $e['hook'];
@@ -175,15 +179,13 @@ function anchor_wf_stagger_scan_cron( $force = false ) {
     }
 
     foreach ( $by_hook as $hook => $data ) {
-        // Remove ALL future instances of this hook (any args).
-        while ( $t = wp_next_scheduled( $hook ) ) {
-            wp_unschedule_event( $t, $hook ); // removes one instance; loop clears all
-        }
+        // Remove all existing instances for this hook (any args).
+        anchor_cron_remove_all_instances_for_hook( $hook );
 
-        // Schedule exactly one scan-start event at the target time.
+        // Schedule exactly one instance at the target.
         $args = isset( $data['keep_args'] ) && is_array( $data['keep_args'] ) ? $data['keep_args'] : array();
 
-        // Most Wordfence scan-start hooks are single events. Keep it single to match observed behavior.
+        // In your screenshots, this is always single; keep single to match Wordfence behavior.
         wp_schedule_single_event( $target, $hook, $args );
     }
 
@@ -191,7 +193,7 @@ function anchor_wf_stagger_scan_cron( $force = false ) {
 }
 
 /**
- * Provide admin-readable info: detected WF scan cron events (if any) + target.
+ * Admin-readable info.
  */
 function anchor_wf_get_next_scan_event_info() {
     $events = anchor_wf_find_scan_cron_events();
@@ -203,7 +205,6 @@ function anchor_wf_get_next_scan_event_info() {
     );
 }
 
-// Attempt a daily best-effort reschedule (lightweight). Runs on init.
 add_action( 'init', function() {
     anchor_wf_stagger_scan_cron( false );
 }, 1 );
@@ -212,29 +213,25 @@ add_action( 'init', function() {
 // ** Admin Menu & Page **
 // -----------------------------------------------------------------------------
 
-// Add the "Anchor" top-level menu
 function anchor_add_admin_page() {
     add_menu_page(
-        'Anchor',                 // Page title
-        'Anchor',                 // Menu title
-        'manage_options',         // Capability
-        'anchor-plugin',          // Menu slug
-        'anchor_admin_page',      // Callback function
-        'dashicons-admin-site-alt3' // Icon (closest available to a sea anchor)
+        'Anchor',
+        'Anchor',
+        'manage_options',
+        'anchor-plugin',
+        'anchor_admin_page',
+        'dashicons-admin-site-alt3'
     );
 }
 add_action( 'admin_menu', 'anchor_add_admin_page' );
 
-// Admin page content with buttons for various tools, including disabling pingbacks/trackbacks
 function anchor_admin_page() {
     echo '<div class="wrap">';
     echo '<h1>Anchor Admin Tools</h1>';
 
-    // Ensure nonces for form security
     $nonce_action = 'anchor_admin_actions';
     $nonce_name   = 'anchor_admin_nonce';
 
-    // Style buttons to sit inline with spacing
     echo '<style>
         .anchor-button-wrapper form {
             display: inline-block;
@@ -248,56 +245,48 @@ function anchor_admin_page() {
             border: 1px solid #c3c4c7;
             border-radius: 4px;
         }
-        .anchor-section h2 {
-            margin-top: 0;
-        }
-        .anchor-kv {
-            margin: 8px 0;
-        }
-        .anchor-kv code {
-            font-size: 12px;
-        }
+        .anchor-section h2 { margin-top: 0; }
+        .anchor-kv { margin: 8px 0; }
+        .anchor-kv code { font-size: 12px; }
     </style>';
 
     echo '<div class="anchor-button-wrapper">';
 
-    // 1) Permalink flush button
+    // 1) Permalink flush
     echo '<form method="post" action="">';
     wp_nonce_field( $nonce_action, $nonce_name );
     echo '<input type="hidden" name="anchor_action" value="flush_permalinks">';
     echo '<input type="submit" class="button button-primary" value="Flush Permalinks Now">';
     echo '</form>';
 
-    // 2) Error reporting toggle button
+    // 2) Error reporting toggle
     $error_reporting_enabled = get_option( 'anchor_error_reporting_enabled' ) === '1';
     $error_label            = $error_reporting_enabled
         ? 'Disable Error Reporting for Admins'
         : 'Enable Error Reporting for Admins';
+
     echo '<form method="post" action="">';
     wp_nonce_field( $nonce_action, $nonce_name );
     echo '<input type="hidden" name="anchor_action" value="toggle_error_reporting">';
     echo '<input type="submit" class="button button-primary" value="' . esc_attr( $error_label ) . '">';
     echo '</form>';
 
-    // 3) Disable Pingbacks & Trackbacks button
+    // 3) Disable pings
     $pings_disabled = get_option( 'anchor_disable_pings_enabled' ) === '1';
-    $pings_label    = $pings_disabled
-        ? 'Pingbacks/Trackbacks Already Disabled'
-        : 'Disable Pingbacks & Trackbacks';
-    // If already disabled, disable the button
-    $button_attr = $pings_disabled ? 'disabled' : '';
+    $pings_label    = $pings_disabled ? 'Pingbacks/Trackbacks Already Disabled' : 'Disable Pingbacks & Trackbacks';
+    $button_attr    = $pings_disabled ? 'disabled' : '';
+
     echo '<form method="post" action="">';
     wp_nonce_field( $nonce_action, $nonce_name );
     echo '<input type="hidden" name="anchor_action" value="disable_pings">';
     echo '<input type="submit" class="button button-primary" value="' . esc_attr( $pings_label ) . '" ' . $button_attr . '>';
     echo '</form>';
 
-    echo '</div>'; // End button wrapper
+    echo '</div>'; // wrapper
 
-    // Handle submitted actions
+    // Handle actions
     if ( isset( $_POST['anchor_action'] ) && check_admin_referer( $nonce_action, $nonce_name ) ) {
         switch ( sanitize_text_field( $_POST['anchor_action'] ) ) {
-
             case 'flush_permalinks':
                 anchor_flush_permalinks();
                 break;
@@ -314,7 +303,6 @@ function anchor_admin_page() {
                 if ( ! $pings_disabled ) {
                     update_option( 'anchor_disable_pings_enabled', '1' );
                     echo '<div class="notice notice-success"><p>Pingbacks and trackbacks have been disabled site-wide.</p></div>';
-                    // Optionally, also disable for existing posts by updating options
                     update_option( 'default_ping_status', 'closed' );
                     update_option( 'default_pingback_flag', '0' );
                 }
@@ -335,7 +323,7 @@ function anchor_admin_page() {
         }
     }
 
-    // Wordfence Stagger Info Section
+    // Wordfence section
     $wf_enabled = anchor_wf_is_enabled();
     $info       = anchor_wf_get_next_scan_event_info();
     $target_ts  = (int) $info['target'];
@@ -357,14 +345,12 @@ function anchor_admin_page() {
     echo '<input type="submit" class="button button-secondary" value="Apply Staggering Now">';
     echo '</form>';
 
-    // Display target time
     $target_str = function_exists( 'wp_date' )
         ? wp_date( 'Y-m-d H:i:s T', $target_ts )
         : date_i18n( 'Y-m-d H:i:s T', $target_ts );
 
     echo '<div class="anchor-kv"><strong>Target scan time (this site):</strong> ' . esc_html( $target_str ) . '</div>';
 
-    // Display detected WF scan cron hook(s)
     if ( empty( $info['events'] ) ) {
         echo '<p><em>No Wordfence scan cron hooks detected on this site (or Wordfence not installed / hook name not matched).</em></p>';
     } else {
@@ -373,7 +359,6 @@ function anchor_admin_page() {
         echo '<thead><tr><th>Hook</th><th>Next Run</th><th>Schedule</th><th>Args</th></tr></thead>';
         echo '<tbody>';
 
-        // Show up to 10 rows
         $shown = 0;
         foreach ( $info['events'] as $e ) {
             if ( $shown >= 10 ) {
@@ -398,7 +383,7 @@ function anchor_admin_page() {
             echo '<p><em>Showing first 10 detected events.</em></p>';
         }
 
-        echo '<p style="max-width: 1100px;"><em>After staggering runs, there should be only one scheduled scan-start event per hook. If you still see duplicates, click “Apply Staggering Now” once.</em></p>';
+        echo '<p style="max-width: 1100px;"><em>After staggering runs, there should be only one scheduled scan-start event per hook. If duplicates persist after clicking “Apply Staggering Now”, update to 1.1.7+ (fixes arg-mismatch unschedule).</em></p>';
     }
 
     $last = (int) get_option( 'anchor_wf_stagger_last_reschedule', 0 );
@@ -410,12 +395,11 @@ function anchor_admin_page() {
     }
 
     echo '<p style="max-width: 1100px;"><em>Notes:</em> This is a best-effort rescheduler. Wordfence hook names vary by version; if no hooks are detected here, this feature will not change anything on this site.</p>';
-    echo '</div>'; // anchor-section
+    echo '</div>'; // section
 
-    echo '</div>';
+    echo '</div>'; // wrap
 }
 
-// Function to flush permalinks and show a success notice
 function anchor_flush_permalinks() {
     flush_rewrite_rules( true );
     echo '<div class="notice notice-success"><p>Permalinks have been flushed successfully.</p></div>';
@@ -425,20 +409,16 @@ function anchor_flush_permalinks() {
 // ** Error Reporting Control **
 // -----------------------------------------------------------------------------
 
-// Dynamically control PHP error reporting based on the admin setting
 function anchor_set_error_reporting() {
     if ( get_option( 'anchor_error_reporting_enabled' ) === '1' ) {
         if ( current_user_can( 'administrator' ) && is_user_logged_in() ) {
-            // Show all PHP errors to admins
             error_reporting( E_ALL );
             @ini_set( 'display_errors', 1 );
         } else {
-            // Hide errors for non-admins or guests
             error_reporting( 0 );
             @ini_set( 'display_errors', 0 );
         }
     } else {
-        // If the feature is “off,” hide errors universally
         error_reporting( 0 );
         @ini_set( 'display_errors', 0 );
     }
@@ -449,15 +429,12 @@ add_action( 'init', 'anchor_set_error_reporting' );
 // ** Pingbacks & Trackbacks Disabling **
 // -----------------------------------------------------------------------------
 
-// On every page load, if the “disable pings” option is set, apply filters to block them.
 function anchor_disable_pings_apply() {
     if ( get_option( 'anchor_disable_pings_enabled' ) === '1' ) {
 
-        // 1) Force new posts to have pingbacks/trackbacks off
         add_filter( 'pre_option_default_pingback_flag', '__return_zero' );
         add_filter( 'pre_option_default_ping_status', '__return_zero' );
 
-        // 2) Disable XML-RPC pingback.ping method so remote sites cannot send pingbacks
         add_filter( 'xmlrpc_methods', function( $methods ) {
             if ( isset( $methods['pingback.ping'] ) ) {
                 unset( $methods['pingback.ping'] );
@@ -465,7 +442,6 @@ function anchor_disable_pings_apply() {
             return $methods;
         });
 
-        // 3) Prevent self-pings (WP sending a trackback to itself)
         add_action( 'pre_ping', function( &$links ) {
             $home_url = get_option( 'home' );
             foreach ( $links as $l => $link ) {
@@ -475,7 +451,6 @@ function anchor_disable_pings_apply() {
             }
         });
 
-        // 4) Remove the “X-Pingback” HTTP header so bots can’t easily find the XML-RPC endpoint
         add_filter( 'wp_headers', function( $headers ) {
             if ( isset( $headers['X-Pingback'] ) ) {
                 unset( $headers['X-Pingback'] );
@@ -483,20 +458,15 @@ function anchor_disable_pings_apply() {
             return $headers;
         });
 
-        // 5) Disable XML-RPC entirely to prevent any pingback calls
         add_filter( 'xmlrpc_enabled', '__return_false' );
     }
 }
 add_action( 'init', 'anchor_disable_pings_apply' );
 
 /**
- * Force‐disable Duplicator Pro email summaries:
- *  - Overrides any submitted frequency to "never"
- *  - Clears the scheduled cron
- *  - Persists "never" via the Global Entity (SnapIO)
+ * Force-disable Duplicator Pro email summaries.
  */
 function anchor_force_disable_duplicator_summaries() {
-    // Bail if Duplicator Pro isn’t loaded or the classes aren’t available
     if (
         ! defined( 'DUPLICATOR_PRO_VERSION' )
         || ! class_exists( EmailSummary::class )
@@ -505,17 +475,13 @@ function anchor_force_disable_duplicator_summaries() {
         return;
     }
 
-    // 1) If the Settings page is submitting a frequency, force it to 'never'
     if ( isset( $_REQUEST['_email_summary_frequency'] ) ) {
         $_REQUEST['_email_summary_frequency'] = EmailSummary::SEND_FREQ_NEVER;
         $_POST   ['_email_summary_frequency'] = EmailSummary::SEND_FREQ_NEVER;
     }
 
-    // 2) Unschedule any pending summary email
     wp_clear_scheduled_hook( 'duplicator_weekly_summary' );
 
-    // 3) Programmatically set + save "never" in Duplicator Pro’s Global Entity
-    /** @var \DUP_PRO_Global_Entity $global */
     $global = \DUP_PRO_Global_Entity::getInstance();
     $global->setEmailSummaryFrequency( EmailSummary::SEND_FREQ_NEVER );
     $global->save();
@@ -526,33 +492,21 @@ add_action( 'admin_init', 'anchor_force_disable_duplicator_summaries', 1 );
 // ** Activation & Deactivation Hooks **
 // -----------------------------------------------------------------------------
 
-/**
- * On plugin activation: clear cron and force “never” for Duplicator Pro summaries.
- */
 function anchor_activate() {
-    // Flush permalinks
     flush_rewrite_rules( true );
-
-    // Disable any Duplicator Pro weekly summary immediately
     anchor_force_disable_duplicator_summaries();
 
-    // Default our own features off
     update_option( 'anchor_error_reporting_enabled', '0' );
     update_option( 'anchor_disable_pings_enabled',   '0' );
 
-    // Default Wordfence staggering ON (safe no-op if no Wordfence scan hooks found)
     if ( get_option( 'anchor_wf_stagger_enabled', null ) === null ) {
         update_option( 'anchor_wf_stagger_enabled', '1', false );
     }
 
-    // Attempt immediate best-effort stagger (and dedupe)
     anchor_wf_stagger_scan_cron( true );
 }
 register_activation_hook( __FILE__, 'anchor_activate' );
 
-/**
- * On Anchor plugin upgrade: rerun the disable routine so you don’t have to visit wp-admin.
- */
 add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
     if (
         isset( $hook_data['action'], $hook_data['type'], $hook_data['plugins'] )
@@ -561,20 +515,13 @@ add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
         && in_array( plugin_basename( __FILE__ ), (array) $hook_data['plugins'], true )
     ) {
         anchor_force_disable_duplicator_summaries();
-
-        // Best-effort apply Wordfence staggering after plugin updates as well.
         anchor_wf_stagger_scan_cron( true );
     }
 }, 10, 2 );
 
 function anchor_deactivate() {
-    // Flush permalinks again when deactivating
     flush_rewrite_rules( true );
-
-    // Clean up our options
     delete_option( 'anchor_error_reporting_enabled' );
     delete_option( 'anchor_disable_pings_enabled' );
-
-    // Intentionally keep WF staggering settings so reactivation preserves behavior.
 }
 register_deactivation_hook( __FILE__, 'anchor_deactivate' );
