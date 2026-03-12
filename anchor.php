@@ -226,6 +226,10 @@ function anchor_add_admin_page() {
 add_action( 'admin_menu', 'anchor_add_admin_page' );
 
 function anchor_admin_page() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( esc_html__( 'You do not have permission to access this page.', 'anchor' ) );
+    }
+
     echo '<div class="wrap">';
     echo '<h1>Anchor Admin Tools</h1>';
 
