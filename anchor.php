@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.1.7
+ * Version: 1.1.8
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
