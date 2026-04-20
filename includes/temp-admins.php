@@ -256,6 +256,89 @@ function anchor_temp_admin_generate_username() {
     return 'anchor-temp-' . strtolower( wp_generate_password( 12, false, false ) );
 }
 
+function anchor_temp_admin_add_login_url_candidate( &$candidates, $url ) {
+    $url = esc_url_raw( (string) $url );
+
+    if ( '' === $url ) {
+        return;
+    }
+
+    $candidates[ $url ] = $url;
+}
+
+function anchor_temp_admin_detect_login_url() {
+    $default_login_url = site_url( 'wp-login.php', 'login' );
+    $candidates        = array();
+
+    anchor_temp_admin_add_login_url_candidate( $candidates, wp_login_url() );
+    anchor_temp_admin_add_login_url_candidate( $candidates, $default_login_url );
+
+    $wsp_hide_login_slug = get_option( 'whl_page' );
+    if ( is_string( $wsp_hide_login_slug ) && '' !== trim( $wsp_hide_login_slug ) ) {
+        anchor_temp_admin_add_login_url_candidate( $candidates, home_url( '/' . trim( $wsp_hide_login_slug, '/' ) . '/' ) );
+    }
+
+    $rename_wp_login_slug = get_option( 'rename_wp_login_slug' );
+    if ( is_string( $rename_wp_login_slug ) && '' !== trim( $rename_wp_login_slug ) ) {
+        anchor_temp_admin_add_login_url_candidate( $candidates, home_url( '/' . trim( $rename_wp_login_slug, '/' ) . '/' ) );
+    }
+
+    $aio_wp_security_configs = get_option( 'aio_wp_security_configs' );
+    if (
+        is_array( $aio_wp_security_configs )
+        && ! empty( $aio_wp_security_configs['aiowps_login_page_slug'] )
+        && is_string( $aio_wp_security_configs['aiowps_login_page_slug'] )
+    ) {
+        anchor_temp_admin_add_login_url_candidate( $candidates, home_url( '/' . trim( $aio_wp_security_configs['aiowps_login_page_slug'], '/' ) . '/' ) );
+    }
+
+    $itsec_hide_backend = get_option( 'itsec_hide_backend' );
+    if (
+        is_array( $itsec_hide_backend )
+        && ! empty( $itsec_hide_backend['enabled'] )
+        && ! empty( $itsec_hide_backend['slug'] )
+        && is_string( $itsec_hide_backend['slug'] )
+    ) {
+        anchor_temp_admin_add_login_url_candidate( $candidates, home_url( '/' . trim( $itsec_hide_backend['slug'], '/' ) . '/' ) );
+    }
+
+    $extra_candidates = apply_filters( 'anchor_temp_admin_login_url_candidates', array_values( $candidates ) );
+    if ( is_array( $extra_candidates ) ) {
+        foreach ( $extra_candidates as $extra_candidate ) {
+            anchor_temp_admin_add_login_url_candidate( $candidates, $extra_candidate );
+        }
+    }
+
+    foreach ( $candidates as $candidate ) {
+        if ( $candidate !== $default_login_url ) {
+            return $candidate;
+        }
+    }
+
+    return ! empty( $candidates ) ? reset( $candidates ) : $default_login_url;
+}
+
+function anchor_temp_admin_credentials_text( $created_account ) {
+    if ( ! is_array( $created_account ) ) {
+        return '';
+    }
+
+    $lines = array(
+        'Temporary admin credentials',
+        'Site: ' . home_url( '/' ),
+        'Login URL: ' . anchor_temp_admin_detect_login_url(),
+        'Username: ' . ( isset( $created_account['username'] ) ? $created_account['username'] : '' ),
+        'Password: ' . ( isset( $created_account['password'] ) ? $created_account['password'] : '' ),
+        'Expires: ' . anchor_format_datetime( isset( $created_account['expires_at'] ) ? $created_account['expires_at'] : 0 ),
+    );
+
+    if ( ! empty( $created_account['label'] ) ) {
+        $lines[] = 'Label: ' . sanitize_text_field( $created_account['label'] );
+    }
+
+    return implode( "\n", array_map( 'sanitize_text_field', $lines ) );
+}
+
 function anchor_temp_admin_create_account( $hours, $label = '' ) {
     $hours = absint( $hours );
     if ( $hours < 1 ) {
@@ -438,7 +521,7 @@ function anchor_temp_admin_enforce_current_user_expiry() {
     anchor_temp_admin_delete_account( $user->ID, 'expired_during_request' );
 
     if ( ! headers_sent() ) {
-        wp_safe_redirect( wp_login_url() );
+        wp_safe_redirect( anchor_temp_admin_detect_login_url() );
         exit;
     }
 
@@ -901,11 +984,84 @@ function anchor_render_temp_admin_section( $nonce_action, $nonce_name, $created_
     echo '<p style="max-width: 1100px;">Create a short-lived administrator for hands-on work. Temp admins expire automatically, are removed on plugin deactivation, cannot manage users or generate more temp admins, and cannot use application passwords.</p>';
 
     if ( is_array( $created_account ) && ! empty( $created_account['username'] ) && ! empty( $created_account['password'] ) ) {
-        echo '<div class="notice notice-warning inline"><p><strong>New temporary admin credentials:</strong></p>';
-        echo '<p><strong>Username:</strong> <code>' . esc_html( $created_account['username'] ) . '</code><br>';
-        echo '<strong>Password:</strong> <code>' . esc_html( $created_account['password'] ) . '</code><br>';
-        echo '<strong>Expires:</strong> ' . esc_html( anchor_format_datetime( $created_account['expires_at'] ) ) . '</p>';
-        echo '<p><em>The password is only shown once here.</em></p></div>';
+        $credentials_text = anchor_temp_admin_credentials_text( $created_account );
+        $textarea_id      = 'anchor-temp-admin-credentials';
+
+        echo '<div class="anchor-copy-card">';
+        echo '<div class="anchor-copy-card-header">';
+        echo '<p><strong>New temporary admin credentials</strong><br><span class="description">The password is only shown once here.</span></p>';
+        echo '<p><button type="button" class="button button-secondary anchor-copy-button" data-copy-target="' . esc_attr( $textarea_id ) . '">Copy Credentials</button><span class="anchor-copy-status" aria-live="polite"></span></p>';
+        echo '</div>';
+        echo '<textarea readonly id="' . esc_attr( $textarea_id ) . '" class="large-text code" rows="7">' . esc_textarea( $credentials_text ) . '</textarea>';
+        echo '<p class="description">Use the copy button to grab the full credential block, including the login URL and expiration time.</p>';
+        echo '</div>';
+        echo '<script>
+        (function() {
+            if (window.anchorTempAdminCopyBound) {
+                return;
+            }
+            window.anchorTempAdminCopyBound = true;
+
+            function setStatus(button, message) {
+                var status = button.parentNode ? button.parentNode.querySelector(".anchor-copy-status") : null;
+                if (!status) {
+                    return;
+                }
+                status.textContent = message;
+                window.setTimeout(function() {
+                    if (status.textContent === message) {
+                        status.textContent = "";
+                    }
+                }, 2500);
+            }
+
+            function fallbackCopy(textarea) {
+                textarea.focus();
+                textarea.select();
+                textarea.setSelectionRange(0, textarea.value.length);
+                try {
+                    return document.execCommand("copy");
+                } catch (error) {
+                    return false;
+                }
+            }
+
+            document.addEventListener("click", function(event) {
+                var button = event.target.closest(".anchor-copy-button");
+                var target;
+
+                if (!button) {
+                    return;
+                }
+
+                target = document.getElementById(button.getAttribute("data-copy-target"));
+                if (!target) {
+                    setStatus(button, "Missing text");
+                    return;
+                }
+
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    navigator.clipboard.writeText(target.value).then(function() {
+                        setStatus(button, "Copied");
+                    }).catch(function() {
+                        if (fallbackCopy(target)) {
+                            setStatus(button, "Copied");
+                            return;
+                        }
+                        setStatus(button, "Copy failed");
+                    });
+                    return;
+                }
+
+                if (fallbackCopy(target)) {
+                    setStatus(button, "Copied");
+                    return;
+                }
+
+                setStatus(button, "Copy failed");
+            });
+        }());
+        </script>';
     }
 
     echo '<form method="post" action="">';

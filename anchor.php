@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.0
+ * Version: 1.2.1
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -323,6 +323,44 @@ function anchor_admin_page() {
         .anchor-section h2 { margin-top: 0; }
         .anchor-kv { margin: 8px 0; }
         .anchor-kv code { font-size: 12px; }
+        .anchor-copy-card {
+            margin: 16px 0;
+            padding: 16px;
+            border: 1px solid #dcdcde;
+            border-left: 4px solid #dba617;
+            background: #fff8e5;
+        }
+        .anchor-copy-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 12px;
+        }
+        .anchor-copy-card-header p {
+            margin: 0;
+        }
+        .anchor-copy-card textarea {
+            width: 100%;
+            min-height: 132px;
+            margin: 0 0 8px;
+            font-family: Consolas, Monaco, monospace;
+        }
+        .anchor-copy-status {
+            margin-left: 8px;
+            font-weight: 600;
+        }
+        @media (max-width: 782px) {
+            .anchor-copy-card-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+            .anchor-copy-status {
+                display: inline-block;
+                margin-left: 0;
+                margin-top: 8px;
+            }
+        }
     </style>';
 
     foreach ( array_merge( $notices, $temp_admin_response['notices'] ) as $notice ) {
