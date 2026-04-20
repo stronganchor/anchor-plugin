@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.1.8
+ * Version: 1.2.0
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -31,6 +31,8 @@ if ( defined( 'ANCHOR_GITHUB_TOKEN' ) && ANCHOR_GITHUB_TOKEN ) {
 
 // Set the branch to "main"
 $myUpdateChecker->setBranch( 'main' );
+
+require_once plugin_dir_path( __FILE__ ) . 'includes/temp-admins.php';
 
 // -----------------------------------------------------------------------------
 // ** Wordfence Scan Cron Staggering (with real dedupe) **
@@ -215,6 +217,10 @@ add_action( 'init', function() {
 // -----------------------------------------------------------------------------
 
 function anchor_add_admin_page() {
+    if ( anchor_is_temp_admin_user() ) {
+        return;
+    }
+
     add_menu_page(
         'Anchor',
         'Anchor',
@@ -231,11 +237,75 @@ function anchor_admin_page() {
         wp_die( esc_html__( 'You do not have permission to access this page.', 'anchor' ) );
     }
 
-    echo '<div class="wrap">';
-    echo '<h1>Anchor Admin Tools</h1>';
+    if ( anchor_is_temp_admin_user() ) {
+        wp_die( esc_html__( 'Temporary admin accounts cannot access this page.', 'anchor' ) );
+    }
+
+    $notices             = array();
+    $temp_admin_response = array(
+        'created_account' => null,
+        'notices'         => array(),
+    );
 
     $nonce_action = 'anchor_admin_actions';
     $nonce_name   = 'anchor_admin_nonce';
+
+    if ( isset( $_POST['anchor_action'] ) && check_admin_referer( $nonce_action, $nonce_name ) ) {
+        $posted_action = sanitize_text_field( wp_unslash( $_POST['anchor_action'] ) );
+
+        switch ( $posted_action ) {
+            case 'flush_permalinks':
+                anchor_flush_permalinks();
+                break;
+
+            case 'toggle_error_reporting':
+                $error_reporting_enabled = get_option( 'anchor_error_reporting_enabled' ) === '1';
+                $new_status              = $error_reporting_enabled ? '0' : '1';
+                update_option( 'anchor_error_reporting_enabled', $new_status );
+                $notices[] = array(
+                    'type'    => 'success',
+                    'message' => 'Error reporting has been ' . ( $new_status === '1' ? 'enabled' : 'disabled' ) . ' for admins.',
+                );
+                break;
+
+            case 'disable_pings':
+                if ( get_option( 'anchor_disable_pings_enabled' ) !== '1' ) {
+                    update_option( 'anchor_disable_pings_enabled', '1' );
+                    update_option( 'default_ping_status', 'closed' );
+                    update_option( 'default_pingback_flag', '0' );
+                    $notices[] = array(
+                        'type'    => 'success',
+                        'message' => 'Pingbacks and trackbacks have been disabled site-wide.',
+                    );
+                }
+                break;
+
+            case 'toggle_wf_stagger':
+                $enabled = anchor_wf_is_enabled();
+                update_option( 'anchor_wf_stagger_enabled', $enabled ? '0' : '1', false );
+                $notices[] = array(
+                    'type'    => 'success',
+                    'message' => 'Wordfence scan staggering has been ' . ( $enabled ? 'disabled' : 'enabled' ) . '.',
+                );
+                break;
+
+            case 'wf_reschedule_now':
+                anchor_wf_stagger_scan_cron( true );
+                $notices[] = array(
+                    'type'    => 'success',
+                    'message' => 'Wordfence scan staggering was applied now (best-effort).',
+                );
+                break;
+
+            case 'create_temp_admin':
+            case 'revoke_temp_admin':
+                $temp_admin_response = anchor_handle_temp_admin_action( $posted_action );
+                break;
+        }
+    }
+
+    echo '<div class="wrap">';
+    echo '<h1>Anchor Admin Tools</h1>';
 
     echo '<style>
         .anchor-button-wrapper form {
@@ -254,6 +324,13 @@ function anchor_admin_page() {
         .anchor-kv { margin: 8px 0; }
         .anchor-kv code { font-size: 12px; }
     </style>';
+
+    foreach ( array_merge( $notices, $temp_admin_response['notices'] ) as $notice ) {
+        $type    = isset( $notice['type'] ) && 'error' === $notice['type'] ? 'notice-error' : 'notice-success';
+        $message = isset( $notice['message'] ) ? $notice['message'] : '';
+
+        echo '<div class="notice ' . esc_attr( $type ) . '"><p>' . esc_html( $message ) . '</p></div>';
+    }
 
     echo '<div class="anchor-button-wrapper">';
 
@@ -289,44 +366,7 @@ function anchor_admin_page() {
 
     echo '</div>'; // wrapper
 
-    // Handle actions
-    if ( isset( $_POST['anchor_action'] ) && check_admin_referer( $nonce_action, $nonce_name ) ) {
-        switch ( sanitize_text_field( $_POST['anchor_action'] ) ) {
-            case 'flush_permalinks':
-                anchor_flush_permalinks();
-                break;
-
-            case 'toggle_error_reporting':
-                $new_status = $error_reporting_enabled ? '0' : '1';
-                update_option( 'anchor_error_reporting_enabled', $new_status );
-                echo '<div class="notice notice-success"><p>Error reporting has been '
-                     . ( $new_status === '1' ? 'enabled' : 'disabled' )
-                     . ' for admins.</p></div>';
-                break;
-
-            case 'disable_pings':
-                if ( ! $pings_disabled ) {
-                    update_option( 'anchor_disable_pings_enabled', '1' );
-                    echo '<div class="notice notice-success"><p>Pingbacks and trackbacks have been disabled site-wide.</p></div>';
-                    update_option( 'default_ping_status', 'closed' );
-                    update_option( 'default_pingback_flag', '0' );
-                }
-                break;
-
-            case 'toggle_wf_stagger':
-                $enabled = anchor_wf_is_enabled();
-                update_option( 'anchor_wf_stagger_enabled', $enabled ? '0' : '1', false );
-                echo '<div class="notice notice-success"><p>Wordfence scan staggering has been '
-                     . ( $enabled ? 'disabled' : 'enabled' )
-                     . '.</p></div>';
-                break;
-
-            case 'wf_reschedule_now':
-                anchor_wf_stagger_scan_cron( true );
-                echo '<div class="notice notice-success"><p>Wordfence scan staggering was applied now (best-effort).</p></div>';
-                break;
-        }
-    }
+    anchor_render_temp_admin_section( $nonce_action, $nonce_name, $temp_admin_response['created_account'] );
 
     // Wordfence section
     $wf_enabled = anchor_wf_is_enabled();
@@ -388,7 +428,7 @@ function anchor_admin_page() {
             echo '<p><em>Showing first 10 detected events.</em></p>';
         }
 
-        echo '<p style="max-width: 1100px;"><em>After staggering runs, there should be only one scheduled scan-start event per hook. If duplicates persist after clicking “Apply Staggering Now”, update to 1.1.7+ (fixes arg-mismatch unschedule).</em></p>';
+        echo '<p style="max-width: 1100px;"><em>After staggering runs, there should be only one scheduled scan-start event per hook. If duplicates persist after clicking "Apply Staggering Now", update to 1.1.7+ (fixes arg-mismatch unschedule).</em></p>';
     }
 
     $last = (int) get_option( 'anchor_wf_stagger_last_reschedule', 0 );
@@ -508,6 +548,7 @@ function anchor_activate() {
         update_option( 'anchor_wf_stagger_enabled', '1', false );
     }
 
+    anchor_temp_admin_schedule_cleanup();
     anchor_wf_stagger_scan_cron( true );
 }
 register_activation_hook( __FILE__, 'anchor_activate' );
@@ -526,6 +567,8 @@ add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
 
 function anchor_deactivate() {
     flush_rewrite_rules( true );
+    anchor_temp_admin_delete_all_accounts( 'plugin_deactivated' );
+    anchor_temp_admin_unschedule_cleanup();
     delete_option( 'anchor_error_reporting_enabled' );
     delete_option( 'anchor_disable_pings_enabled' );
 }
