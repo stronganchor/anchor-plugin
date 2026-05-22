@@ -24,6 +24,18 @@ if ( ! defined( 'ANCHOR_TEMP_ADMIN_LABEL_META' ) ) {
     define( 'ANCHOR_TEMP_ADMIN_LABEL_META', 'anchor_temp_admin_label' );
 }
 
+if ( ! defined( 'ANCHOR_TEMP_ADMIN_WORDFENCE_ALLOWLIST_IP_META' ) ) {
+    define( 'ANCHOR_TEMP_ADMIN_WORDFENCE_ALLOWLIST_IP_META', 'anchor_temp_admin_wordfence_allowlist_ip' );
+}
+
+if ( ! defined( 'ANCHOR_TEMP_ADMIN_WORDFENCE_FIREWALL_ADDED_META' ) ) {
+    define( 'ANCHOR_TEMP_ADMIN_WORDFENCE_FIREWALL_ADDED_META', 'anchor_temp_admin_wordfence_firewall_added' );
+}
+
+if ( ! defined( 'ANCHOR_TEMP_ADMIN_WORDFENCE_LOGIN_ADDED_META' ) ) {
+    define( 'ANCHOR_TEMP_ADMIN_WORDFENCE_LOGIN_ADDED_META', 'anchor_temp_admin_wordfence_login_added' );
+}
+
 if ( ! defined( 'ANCHOR_TEMP_ADMIN_LAST_LOGIN_META' ) ) {
     define( 'ANCHOR_TEMP_ADMIN_LAST_LOGIN_META', 'anchor_temp_admin_last_login_at' );
 }
@@ -128,6 +140,479 @@ function anchor_temp_admin_request_ip() {
     }
 
     return sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) );
+}
+
+function anchor_temp_admin_wordfence_available() {
+    return class_exists( 'wordfence' ) && method_exists( 'wordfence', 'whitelistIP' );
+}
+
+function anchor_temp_admin_wordfence_login_settings_class() {
+    $class = 'WordfenceLS\\Controller_Settings';
+
+    return class_exists( $class ) ? $class : '';
+}
+
+function anchor_temp_admin_wordfence_login_whitelist_class() {
+    $class = 'WordfenceLS\\Controller_Whitelist';
+
+    return class_exists( $class ) ? $class : '';
+}
+
+function anchor_temp_admin_wordfence_login_option_name() {
+    $settings_class = anchor_temp_admin_wordfence_login_settings_class();
+    $constant       = $settings_class ? $settings_class . '::OPTION_2FA_WHITELISTED' : '';
+
+    return $constant && defined( $constant ) ? constant( $constant ) : 'whitelisted';
+}
+
+function anchor_temp_admin_wordfence_detect_current_ip() {
+    $ip = '';
+
+    if ( class_exists( 'wfUtils' ) && method_exists( 'wfUtils', 'getIP' ) ) {
+        try {
+            $ip = wfUtils::getIP();
+        } catch ( Exception $e ) {
+            $ip = '';
+        }
+    }
+
+    if ( ! is_string( $ip ) || ! filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+        $ip = anchor_temp_admin_request_ip();
+    }
+
+    return is_string( $ip ) && filter_var( $ip, FILTER_VALIDATE_IP ) ? $ip : '';
+}
+
+function anchor_temp_admin_wordfence_normalize_ip_entry( $entry ) {
+    $entry = sanitize_text_field( (string) $entry );
+    $entry = preg_replace( '/[,\r\n\t]+/', '', $entry );
+    $entry = trim( (string) $entry );
+
+    if ( class_exists( 'wfUserIPRange' ) ) {
+        try {
+            $range = new wfUserIPRange( $entry );
+            if ( method_exists( $range, 'getIPString' ) ) {
+                $normalized = $range->getIPString();
+
+                return is_string( $normalized ) ? $normalized : $entry;
+            }
+        } catch ( Exception $e ) {
+            return $entry;
+        }
+    }
+
+    return strtolower( preg_replace( '/\s+/', '', $entry ) );
+}
+
+function anchor_temp_admin_wordfence_validate_ip_entry( $entry ) {
+    $entry = sanitize_text_field( (string) $entry );
+    $entry = trim( $entry );
+
+    if ( '' === $entry ) {
+        return new WP_Error( 'anchor_wordfence_ip_empty', 'No IP address was provided for Wordfence allowlisting.' );
+    }
+
+    if ( preg_match( '/[,\r\n]/', $entry ) ) {
+        return new WP_Error( 'anchor_wordfence_ip_multiple', 'Enter one IP address or IP range for Wordfence allowlisting.' );
+    }
+
+    if ( class_exists( 'wfUserIPRange' ) ) {
+        try {
+            $range = new wfUserIPRange( $entry );
+            if ( method_exists( $range, 'isValidRange' ) && $range->isValidRange() ) {
+                return anchor_temp_admin_wordfence_normalize_ip_entry( $entry );
+            }
+        } catch ( Exception $e ) {
+            return new WP_Error( 'anchor_wordfence_ip_invalid', $e->getMessage() );
+        }
+    }
+
+    $normalized = anchor_temp_admin_wordfence_normalize_ip_entry( $entry );
+    if ( filter_var( $normalized, FILTER_VALIDATE_IP ) ) {
+        return $normalized;
+    }
+
+    return new WP_Error( 'anchor_wordfence_ip_invalid', 'The Wordfence allowlist value must be a valid IP address or IP range.' );
+}
+
+function anchor_temp_admin_wordfence_firewall_entries() {
+    if ( ! class_exists( 'wfConfig' ) || ! method_exists( 'wfConfig', 'get' ) ) {
+        return null;
+    }
+
+    try {
+        $raw = wfConfig::get( 'whitelisted', '' );
+    } catch ( Exception $e ) {
+        return null;
+    }
+
+    if ( is_array( $raw ) ) {
+        $entries = $raw;
+    } else {
+        $entries = preg_split( '/[\r\n,]+/', (string) $raw );
+    }
+
+    return array_values(
+        array_filter(
+            array_map(
+                'trim',
+                $entries
+            ),
+            'strlen'
+        )
+    );
+}
+
+function anchor_temp_admin_wordfence_login_entries() {
+    $settings_class = anchor_temp_admin_wordfence_login_settings_class();
+
+    if ( ! $settings_class || ! method_exists( $settings_class, 'shared' ) ) {
+        return null;
+    }
+
+    try {
+        $settings = $settings_class::shared();
+
+        if ( ! is_object( $settings ) || ! method_exists( $settings, 'whitelisted_ips' ) ) {
+            return null;
+        }
+
+        $entries = $settings->whitelisted_ips();
+    } catch ( Exception $e ) {
+        return null;
+    }
+
+    return is_array( $entries ) ? array_values( array_filter( array_map( 'trim', $entries ), 'strlen' ) ) : array();
+}
+
+function anchor_temp_admin_wordfence_entry_contains_ip( $entry, $ip ) {
+    $entry = trim( (string) $entry );
+    $ip    = trim( (string) $ip );
+
+    if ( '' === $entry || ! filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+        return false;
+    }
+
+    if ( class_exists( 'wfUserIPRange' ) ) {
+        try {
+            $range = new wfUserIPRange( $entry );
+            if ( method_exists( $range, 'isValidRange' ) && $range->isValidRange() && method_exists( $range, 'isIPInRange' ) ) {
+                return (bool) $range->isIPInRange( $ip );
+            }
+        } catch ( Exception $e ) {
+            return false;
+        }
+    }
+
+    $whitelist_class = anchor_temp_admin_wordfence_login_whitelist_class();
+    if ( $whitelist_class && method_exists( $whitelist_class, 'shared' ) ) {
+        try {
+            $whitelist = $whitelist_class::shared();
+            if ( is_object( $whitelist ) && method_exists( $whitelist, 'ip_in_range' ) ) {
+                return (bool) $whitelist->ip_in_range( $ip, $entry );
+            }
+        } catch ( Exception $e ) {
+            return false;
+        }
+    }
+
+    return anchor_temp_admin_wordfence_normalize_ip_entry( $entry ) === anchor_temp_admin_wordfence_normalize_ip_entry( $ip );
+}
+
+function anchor_temp_admin_wordfence_entries_contain_ip( $entries, $ip ) {
+    if ( ! is_array( $entries ) ) {
+        return null;
+    }
+
+    foreach ( $entries as $entry ) {
+        if ( anchor_temp_admin_wordfence_entry_contains_ip( $entry, $ip ) ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function anchor_temp_admin_wordfence_allowlist_status( $ip = '' ) {
+    $ip = $ip ? sanitize_text_field( (string) $ip ) : anchor_temp_admin_wordfence_detect_current_ip();
+
+    $firewall_entries     = anchor_temp_admin_wordfence_firewall_entries();
+    $login_entries        = anchor_temp_admin_wordfence_login_entries();
+    $firewall_readable    = is_array( $firewall_entries );
+    $login_module_present = (bool) anchor_temp_admin_wordfence_login_settings_class();
+    $login_readable       = is_array( $login_entries );
+    $firewall_allowlisted = $firewall_readable ? anchor_temp_admin_wordfence_entries_contain_ip( $firewall_entries, $ip ) : null;
+    $login_allowlisted    = $login_readable ? anchor_temp_admin_wordfence_entries_contain_ip( $login_entries, $ip ) : null;
+    $already_allowlisted  = false;
+
+    if ( $firewall_readable && true === $firewall_allowlisted ) {
+        $already_allowlisted = ! $login_module_present || ( $login_readable && true === $login_allowlisted );
+    }
+
+    return array(
+        'available'             => anchor_temp_admin_wordfence_available(),
+        'ip'                    => $ip,
+        'firewall_readable'     => $firewall_readable,
+        'firewall_allowlisted'  => $firewall_allowlisted,
+        'login_module_present'  => $login_module_present,
+        'login_readable'        => $login_readable,
+        'login_allowlisted'     => $login_allowlisted,
+        'already_allowlisted'   => $already_allowlisted,
+        'needs_allowlist_entry' => ! $already_allowlisted,
+    );
+}
+
+function anchor_temp_admin_wordfence_sync_firewall_allowlist() {
+    if ( ! class_exists( 'wfConfig' ) || ! method_exists( 'wfConfig', 'get' ) ) {
+        return false;
+    }
+
+    try {
+        $allowlist = (string) wfConfig::get( 'whitelisted', '' );
+
+        if ( class_exists( 'wfWAF' ) && method_exists( 'wfWAF', 'getInstance' ) ) {
+            $waf = wfWAF::getInstance();
+            if ( is_object( $waf ) && method_exists( $waf, 'getStorageEngine' ) ) {
+                $storage = $waf->getStorageEngine();
+
+                if ( is_object( $storage ) && method_exists( $storage, 'setConfig' ) ) {
+                    $storage->setConfig( 'whitelistedIPs', $allowlist, 'synced' );
+                }
+
+                if (
+                    is_object( $storage )
+                    && method_exists( $storage, 'purgeIPBlocks' )
+                    && ( class_exists( 'wfWAFStorageInterface' ) || interface_exists( 'wfWAFStorageInterface' ) )
+                    && defined( 'wfWAFStorageInterface::IP_BLOCKS_BLACKLIST' )
+                ) {
+                    $storage->purgeIPBlocks( wfWAFStorageInterface::IP_BLOCKS_BLACKLIST );
+                }
+            }
+        }
+
+        if ( class_exists( 'wfWAFIPBlocksController' ) && method_exists( 'wfWAFIPBlocksController', 'setNeedsSynchronizeConfigSettings' ) ) {
+            wfWAFIPBlocksController::setNeedsSynchronizeConfigSettings();
+        }
+    } catch ( Exception $e ) {
+        return false;
+    }
+
+    return true;
+}
+
+function anchor_temp_admin_wordfence_unblock_ip( $entry ) {
+    if ( ! filter_var( $entry, FILTER_VALIDATE_IP ) ) {
+        return;
+    }
+
+    try {
+        if ( class_exists( 'wfBlock' ) && method_exists( 'wfBlock', 'unblockIP' ) ) {
+            wfBlock::unblockIP( $entry, false );
+        }
+
+        if ( class_exists( 'wordfence' ) && method_exists( 'wordfence', 'clearLockoutCounters' ) ) {
+            wordfence::clearLockoutCounters( $entry );
+        }
+    } catch ( Exception $e ) {
+        return;
+    }
+}
+
+function anchor_temp_admin_wordfence_allowlist_login_security( $entry ) {
+    $settings_class = anchor_temp_admin_wordfence_login_settings_class();
+
+    if ( ! $settings_class || ! method_exists( $settings_class, 'shared' ) ) {
+        return null;
+    }
+
+    try {
+        $settings = $settings_class::shared();
+        if ( ! is_object( $settings ) || ! method_exists( $settings, 'set' ) || ! method_exists( $settings, 'whitelisted_ips' ) ) {
+            return null;
+        }
+
+        $entries = $settings->whitelisted_ips();
+        if ( ! is_array( $entries ) ) {
+            $entries = array();
+        }
+
+        if ( filter_var( $entry, FILTER_VALIDATE_IP ) && true === anchor_temp_admin_wordfence_entries_contain_ip( $entries, $entry ) ) {
+            return false;
+        }
+
+        $normalized_entry = anchor_temp_admin_wordfence_normalize_ip_entry( $entry );
+        foreach ( $entries as $existing_entry ) {
+            if ( anchor_temp_admin_wordfence_normalize_ip_entry( $existing_entry ) === $normalized_entry ) {
+                return false;
+            }
+        }
+
+        $entries[] = $normalized_entry;
+
+        return (bool) $settings->set( anchor_temp_admin_wordfence_login_option_name(), implode( "\n", array_unique( $entries ) ) );
+    } catch ( Exception $e ) {
+        return null;
+    }
+}
+
+function anchor_temp_admin_wordfence_allowlist_ip( $entry ) {
+    if ( ! anchor_temp_admin_wordfence_available() ) {
+        return new WP_Error( 'anchor_wordfence_unavailable', 'Wordfence is not active or its allowlist API is unavailable.' );
+    }
+
+    $entry = anchor_temp_admin_wordfence_validate_ip_entry( $entry );
+    if ( is_wp_error( $entry ) ) {
+        return $entry;
+    }
+
+    try {
+        $firewall_added = (bool) wordfence::whitelistIP( $entry );
+    } catch ( Exception $e ) {
+        return new WP_Error( 'anchor_wordfence_allowlist_failed', $e->getMessage() );
+    }
+
+    anchor_temp_admin_wordfence_sync_firewall_allowlist();
+    anchor_temp_admin_wordfence_unblock_ip( $entry );
+
+    $login_added = anchor_temp_admin_wordfence_allowlist_login_security( $entry );
+
+    return array(
+        'ip'             => $entry,
+        'firewall_added' => $firewall_added,
+        'login_added'    => $login_added,
+    );
+}
+
+function anchor_temp_admin_wordfence_remove_firewall_entry( $entry ) {
+    if ( ! class_exists( 'wfConfig' ) || ! method_exists( 'wfConfig', 'set' ) ) {
+        return false;
+    }
+
+    $entries = anchor_temp_admin_wordfence_firewall_entries();
+    if ( ! is_array( $entries ) ) {
+        return false;
+    }
+
+    $normalized_entry = anchor_temp_admin_wordfence_normalize_ip_entry( $entry );
+    $new_entries      = array();
+    $removed          = false;
+
+    foreach ( $entries as $existing_entry ) {
+        if ( anchor_temp_admin_wordfence_normalize_ip_entry( $existing_entry ) === $normalized_entry ) {
+            $removed = true;
+            continue;
+        }
+
+        $new_entries[] = $existing_entry;
+    }
+
+    if ( $removed ) {
+        wfConfig::set( 'whitelisted', implode( ',', $new_entries ) );
+        anchor_temp_admin_wordfence_sync_firewall_allowlist();
+    }
+
+    return $removed;
+}
+
+function anchor_temp_admin_wordfence_remove_login_entry( $entry ) {
+    $settings_class = anchor_temp_admin_wordfence_login_settings_class();
+
+    if ( ! $settings_class || ! method_exists( $settings_class, 'shared' ) ) {
+        return false;
+    }
+
+    try {
+        $settings = $settings_class::shared();
+        if ( ! is_object( $settings ) || ! method_exists( $settings, 'set' ) || ! method_exists( $settings, 'whitelisted_ips' ) ) {
+            return false;
+        }
+
+        $entries          = $settings->whitelisted_ips();
+        $normalized_entry = anchor_temp_admin_wordfence_normalize_ip_entry( $entry );
+        $new_entries      = array();
+        $removed          = false;
+
+        foreach ( (array) $entries as $existing_entry ) {
+            if ( anchor_temp_admin_wordfence_normalize_ip_entry( $existing_entry ) === $normalized_entry ) {
+                $removed = true;
+                continue;
+            }
+
+            $new_entries[] = $existing_entry;
+        }
+
+        if ( $removed ) {
+            $settings->set( anchor_temp_admin_wordfence_login_option_name(), implode( "\n", $new_entries ) );
+        }
+
+        return $removed;
+    } catch ( Exception $e ) {
+        return false;
+    }
+}
+
+function anchor_temp_admin_wordfence_other_temp_admin_uses_ip( $ip, $added_meta_key, $exclude_user_id ) {
+    foreach ( anchor_temp_admin_get_users() as $user ) {
+        if ( (int) $user->ID === (int) $exclude_user_id ) {
+            continue;
+        }
+
+        if (
+            get_user_meta( $user->ID, ANCHOR_TEMP_ADMIN_WORDFENCE_ALLOWLIST_IP_META, true ) === $ip
+            && get_user_meta( $user->ID, $added_meta_key, true ) === '1'
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function anchor_temp_admin_wordfence_cleanup_for_user( $user ) {
+    $user = anchor_get_temp_admin_user( $user );
+    if ( ! $user instanceof WP_User ) {
+        return;
+    }
+
+    $ip = get_user_meta( $user->ID, ANCHOR_TEMP_ADMIN_WORDFENCE_ALLOWLIST_IP_META, true );
+    if ( '' === $ip ) {
+        return;
+    }
+
+    $removed = array();
+
+    if (
+        get_user_meta( $user->ID, ANCHOR_TEMP_ADMIN_WORDFENCE_FIREWALL_ADDED_META, true ) === '1'
+        && ! anchor_temp_admin_wordfence_other_temp_admin_uses_ip( $ip, ANCHOR_TEMP_ADMIN_WORDFENCE_FIREWALL_ADDED_META, $user->ID )
+        && anchor_temp_admin_wordfence_remove_firewall_entry( $ip )
+    ) {
+        $removed[] = 'firewall';
+    }
+
+    if (
+        get_user_meta( $user->ID, ANCHOR_TEMP_ADMIN_WORDFENCE_LOGIN_ADDED_META, true ) === '1'
+        && ! anchor_temp_admin_wordfence_other_temp_admin_uses_ip( $ip, ANCHOR_TEMP_ADMIN_WORDFENCE_LOGIN_ADDED_META, $user->ID )
+        && anchor_temp_admin_wordfence_remove_login_entry( $ip )
+    ) {
+        $removed[] = 'login security';
+    }
+
+    if ( ! empty( $removed ) ) {
+        anchor_log_temp_admin_event(
+            'wordfence_ip_allowlist_removed',
+            sprintf(
+                'Removed Wordfence %1$s allowlist entry %2$s for temp admin %3$s.',
+                implode( ' and ', $removed ),
+                $ip,
+                $user->user_login
+            ),
+            array(
+                'subject_user_id'    => $user->ID,
+                'subject_user_login' => $user->user_login,
+                'ip'                 => $ip,
+            )
+        );
+    }
 }
 
 function anchor_temp_admin_sanitized_request_uri() {
@@ -336,10 +821,14 @@ function anchor_temp_admin_credentials_text( $created_account ) {
         $lines[] = 'Label: ' . sanitize_text_field( $created_account['label'] );
     }
 
+    if ( ! empty( $created_account['wordfence_allowlist']['ip'] ) ) {
+        $lines[] = 'Wordfence allowlisted IP: ' . sanitize_text_field( $created_account['wordfence_allowlist']['ip'] );
+    }
+
     return implode( "\n", array_map( 'sanitize_text_field', $lines ) );
 }
 
-function anchor_temp_admin_create_account( $hours, $label = '' ) {
+function anchor_temp_admin_create_account( $hours, $label = '', $wordfence_allowlist_ip = '' ) {
     $hours = absint( $hours );
     if ( $hours < 1 ) {
         $hours = anchor_temp_admin_default_hours();
@@ -374,6 +863,44 @@ function anchor_temp_admin_create_account( $hours, $label = '' ) {
     update_user_meta( $user_id, ANCHOR_TEMP_ADMIN_LABEL_META, $label );
     update_user_meta( $user_id, 'show_admin_bar_front', 'false' );
 
+    $wordfence_allowlist = null;
+    if ( '' !== $wordfence_allowlist_ip ) {
+        $wordfence_allowlist = anchor_temp_admin_wordfence_allowlist_ip( $wordfence_allowlist_ip );
+
+        if ( is_wp_error( $wordfence_allowlist ) ) {
+            anchor_log_temp_admin_event(
+                'wordfence_ip_allowlist_failed',
+                sprintf(
+                    'Failed to add Wordfence allowlist entry for temp admin %1$s: %2$s.',
+                    $username,
+                    $wordfence_allowlist->get_error_message()
+                ),
+                array(
+                    'subject_user_id'    => $user_id,
+                    'subject_user_login' => $username,
+                )
+            );
+        } else {
+            update_user_meta( $user_id, ANCHOR_TEMP_ADMIN_WORDFENCE_ALLOWLIST_IP_META, $wordfence_allowlist['ip'] );
+            update_user_meta( $user_id, ANCHOR_TEMP_ADMIN_WORDFENCE_FIREWALL_ADDED_META, ! empty( $wordfence_allowlist['firewall_added'] ) ? '1' : '0' );
+            update_user_meta( $user_id, ANCHOR_TEMP_ADMIN_WORDFENCE_LOGIN_ADDED_META, ! empty( $wordfence_allowlist['login_added'] ) ? '1' : '0' );
+
+            anchor_log_temp_admin_event(
+                'wordfence_ip_allowlisted',
+                sprintf(
+                    'Added Wordfence allowlist entry %1$s for temp admin %2$s.',
+                    $wordfence_allowlist['ip'],
+                    $username
+                ),
+                array(
+                    'subject_user_id'    => $user_id,
+                    'subject_user_login' => $username,
+                    'ip'                 => $wordfence_allowlist['ip'],
+                )
+            );
+        }
+    }
+
     anchor_log_temp_admin_event(
         'account_created',
         sprintf(
@@ -394,6 +921,8 @@ function anchor_temp_admin_create_account( $hours, $label = '' ) {
         'password'   => $password,
         'expires_at' => $expires_at,
         'label'      => $label,
+        'wordfence_allowlist' => is_wp_error( $wordfence_allowlist ) ? null : $wordfence_allowlist,
+        'wordfence_allowlist_error' => is_wp_error( $wordfence_allowlist ) ? $wordfence_allowlist : null,
     );
 }
 
@@ -435,6 +964,8 @@ function anchor_temp_admin_delete_account( $user_id, $reason = 'expired' ) {
     }
 
     require_once ABSPATH . 'wp-admin/includes/user.php';
+
+    anchor_temp_admin_wordfence_cleanup_for_user( $user );
 
     $reassign = anchor_temp_admin_reassign_user_id( $user->ID );
     $deleted  = $reassign > 0 ? wp_delete_user( $user->ID, $reassign ) : wp_delete_user( $user->ID );
@@ -904,6 +1435,9 @@ function anchor_temp_admin_event_label( $event ) {
         'content_saved'      => 'Content Saved',
         'content_trashed'    => 'Content Trashed',
         'content_deleted'    => 'Content Deleted',
+        'wordfence_ip_allowlisted' => 'Wordfence IP Allowlisted',
+        'wordfence_ip_allowlist_failed' => 'Wordfence IP Allowlist Failed',
+        'wordfence_ip_allowlist_removed' => 'Wordfence IP Removed',
     );
 
     return isset( $labels[ $event ] ) ? $labels[ $event ] : ucwords( str_replace( '_', ' ', sanitize_key( $event ) ) );
@@ -919,6 +1453,7 @@ function anchor_handle_temp_admin_action( $action ) {
         case 'create_temp_admin':
             $hours = isset( $_POST['anchor_temp_admin_hours'] ) ? wp_unslash( $_POST['anchor_temp_admin_hours'] ) : anchor_temp_admin_default_hours();
             $label = isset( $_POST['anchor_temp_admin_label'] ) ? wp_unslash( $_POST['anchor_temp_admin_label'] ) : '';
+            $wordfence_allowlist_ip = '';
             $hours = absint( $hours );
 
             if ( $hours < 1 ) {
@@ -929,7 +1464,33 @@ function anchor_handle_temp_admin_action( $action ) {
                 $hours = anchor_temp_admin_max_hours();
             }
 
-            $created = anchor_temp_admin_create_account( $hours, $label );
+            if ( ! empty( $_POST['anchor_temp_admin_wordfence_allowlist'] ) ) {
+                $posted_wordfence_ip = isset( $_POST['anchor_temp_admin_wordfence_ip'] ) ? wp_unslash( $_POST['anchor_temp_admin_wordfence_ip'] ) : '';
+                $wordfence_allowlist_ip = '' !== trim( (string) $posted_wordfence_ip )
+                    ? sanitize_text_field( $posted_wordfence_ip )
+                    : anchor_temp_admin_wordfence_detect_current_ip();
+
+                if ( ! anchor_temp_admin_wordfence_available() ) {
+                    $result['notices'][] = array(
+                        'type'    => 'error',
+                        'message' => 'Wordfence is not active or its allowlist API is unavailable.',
+                    );
+                    break;
+                }
+
+                $validated_wordfence_ip = anchor_temp_admin_wordfence_validate_ip_entry( $wordfence_allowlist_ip );
+                if ( is_wp_error( $validated_wordfence_ip ) ) {
+                    $result['notices'][] = array(
+                        'type'    => 'error',
+                        'message' => $validated_wordfence_ip->get_error_message(),
+                    );
+                    break;
+                }
+
+                $wordfence_allowlist_ip = $validated_wordfence_ip;
+            }
+
+            $created = anchor_temp_admin_create_account( $hours, $label, $wordfence_allowlist_ip );
 
             if ( is_wp_error( $created ) ) {
                 $result['notices'][] = array(
@@ -942,6 +1503,18 @@ function anchor_handle_temp_admin_action( $action ) {
                     'type'    => 'success',
                     'message' => 'Temporary admin account created.',
                 );
+
+                if ( ! empty( $created['wordfence_allowlist_error'] ) && is_wp_error( $created['wordfence_allowlist_error'] ) ) {
+                    $result['notices'][] = array(
+                        'type'    => 'error',
+                        'message' => 'Temporary admin was created, but Wordfence IP allowlisting failed: ' . $created['wordfence_allowlist_error']->get_error_message(),
+                    );
+                } elseif ( ! empty( $created['wordfence_allowlist']['ip'] ) ) {
+                    $result['notices'][] = array(
+                        'type'    => 'success',
+                        'message' => 'Wordfence allowlisted IP ' . $created['wordfence_allowlist']['ip'] . ' for this temporary admin.',
+                    );
+                }
             }
             break;
 
@@ -978,6 +1551,7 @@ function anchor_render_temp_admin_section( $nonce_action, $nonce_name, $created_
 
     $active_users = anchor_temp_admin_get_users();
     $log_entries  = anchor_temp_admin_recent_log_entries();
+    $wordfence_status = anchor_temp_admin_wordfence_allowlist_status();
 
     echo '<div class="anchor-section">';
     echo '<h2>Temporary Admin Access</h2>';
@@ -1078,6 +1652,31 @@ function anchor_render_temp_admin_section( $nonce_action, $nonce_name, $created_
     echo '<td><input type="text" id="anchor_temp_admin_label" name="anchor_temp_admin_label" value="" class="regular-text" maxlength="80">';
     echo '<p class="description">Optional note to identify why this account was created.</p></td>';
     echo '</tr>';
+
+    if ( ! empty( $wordfence_status['available'] ) && ! empty( $wordfence_status['ip'] ) ) {
+        echo '<tr>';
+        echo '<th scope="row">Wordfence allowlist</th>';
+        echo '<td>';
+
+        if ( ! empty( $wordfence_status['already_allowlisted'] ) ) {
+            echo '<p class="description">Wordfence already allowlists the current detected IP: <code>' . esc_html( $wordfence_status['ip'] ) . '</code>.</p>';
+        } else {
+            echo '<label for="anchor_temp_admin_wordfence_allowlist">';
+            echo '<input type="checkbox" id="anchor_temp_admin_wordfence_allowlist" name="anchor_temp_admin_wordfence_allowlist" value="1"> ';
+            echo 'Allowlist this IP in Wordfence while the temp admin is active';
+            echo '</label>';
+            echo '<p style="margin: 8px 0 0;"><input type="text" id="anchor_temp_admin_wordfence_ip" name="anchor_temp_admin_wordfence_ip" value="' . esc_attr( $wordfence_status['ip'] ) . '" class="regular-text code"></p>';
+            echo '<p class="description">Detected current admin IP. Edit this if Codex will log in from a different IP. Anchor removes Wordfence entries it adds when the temp admin is revoked or expires.</p>';
+
+            if ( empty( $wordfence_status['firewall_readable'] ) ) {
+                echo '<p class="description">Anchor could not read the existing Wordfence firewall allowlist, so this may duplicate an existing entry.</p>';
+            }
+        }
+
+        echo '</td>';
+        echo '</tr>';
+    }
+
     echo '</table>';
     echo '<p><input type="submit" class="button button-primary" value="Create Temporary Admin"></p>';
     echo '</form>';
