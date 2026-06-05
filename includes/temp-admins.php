@@ -52,6 +52,10 @@ if ( ! defined( 'ANCHOR_TEMP_ADMIN_CLEANUP_HOOK' ) ) {
     define( 'ANCHOR_TEMP_ADMIN_CLEANUP_HOOK', 'anchor_cleanup_temp_admins' );
 }
 
+if ( ! defined( 'ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION' ) ) {
+    define( 'ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION', 'anchor_temp_admin_automation_lease' );
+}
+
 function anchor_temp_admin_default_hours() {
     return 24;
 }
@@ -803,6 +807,688 @@ function anchor_temp_admin_detect_login_url() {
     return ! empty( $candidates ) ? reset( $candidates ) : $default_login_url;
 }
 
+function anchor_temp_admin_automation_lease_ttl() {
+    $ttl = 20 * MINUTE_IN_SECONDS;
+
+    return max( 60, (int) apply_filters( 'anchor_temp_admin_automation_lease_ttl', $ttl ) );
+}
+
+function anchor_temp_admin_automation_lock_base_route() {
+    return '/anchor/v1/automation-lock';
+}
+
+function anchor_temp_admin_automation_lock_rest_url( $path = '' ) {
+    $path = '/' . ltrim( (string) $path, '/' );
+    if ( '/' === $path ) {
+        $path = '';
+    }
+
+    return rest_url( ltrim( anchor_temp_admin_automation_lock_base_route() . $path, '/' ) );
+}
+
+function anchor_temp_admin_automation_datetime( $timestamp ) {
+    $timestamp = (int) $timestamp;
+
+    if ( $timestamp <= 0 ) {
+        return '';
+    }
+
+    return function_exists( 'wp_date' )
+        ? wp_date( DATE_ATOM, $timestamp )
+        : date_i18n( DATE_ATOM, $timestamp );
+}
+
+function anchor_temp_admin_automation_get_route_path() {
+    $rest_route = isset( $_GET['rest_route'] ) ? wp_unslash( (string) $_GET['rest_route'] ) : '';
+    if ( '' !== $rest_route ) {
+        return '/' . ltrim( $rest_route, '/' );
+    }
+
+    $request_uri = isset( $_SERVER['REQUEST_URI'] ) ? (string) $_SERVER['REQUEST_URI'] : '';
+    if ( '' === $request_uri ) {
+        return '';
+    }
+
+    $path = wp_parse_url( $request_uri, PHP_URL_PATH );
+    if ( ! is_string( $path ) || '' === $path ) {
+        return '';
+    }
+
+    $prefix = '/' . trim( (string) rest_get_url_prefix(), '/' ) . '/';
+    $prefix_offset = strpos( $path, $prefix );
+    if ( false === $prefix_offset ) {
+        $prefix_root = '/' . trim( (string) rest_get_url_prefix(), '/' );
+        return untrailingslashit( $path ) === $prefix_root ? '/' : '';
+    }
+
+    $route = substr( $path, $prefix_offset + strlen( $prefix ) - 1 );
+
+    return is_string( $route ) ? '/' . ltrim( $route, '/' ) : '';
+}
+
+function anchor_temp_admin_automation_is_lock_route() {
+    $route = anchor_temp_admin_automation_get_route_path();
+    $base  = anchor_temp_admin_automation_lock_base_route();
+
+    return $route === $base || strpos( $route, $base . '/' ) === 0;
+}
+
+function anchor_temp_admin_automation_has_local_host_context() {
+    $environment_type = function_exists( 'wp_get_environment_type' ) ? wp_get_environment_type() : '';
+    if ( 'local' === $environment_type ) {
+        return true;
+    }
+
+    $host = isset( $_SERVER['HTTP_HOST'] ) ? strtolower( (string) $_SERVER['HTTP_HOST'] ) : '';
+    if ( '' === $host ) {
+        return false;
+    }
+
+    $host = preg_replace( '/:\d+$/', '', $host );
+    if ( ! is_string( $host ) || '' === $host ) {
+        return false;
+    }
+
+    if ( in_array( $host, array( 'localhost', '127.0.0.1', '::1' ), true ) ) {
+        return true;
+    }
+
+    return (bool) preg_match( '/(?:^|\.)local$/', $host );
+}
+
+function anchor_temp_admin_automation_password_auth_is_allowed() {
+    $allowed = is_ssl() || anchor_temp_admin_automation_has_local_host_context();
+
+    return (bool) apply_filters( 'anchor_temp_admin_automation_password_auth_allowed', $allowed );
+}
+
+function anchor_temp_admin_automation_get_basic_auth_credentials() {
+    if ( isset( $_SERVER['PHP_AUTH_USER'], $_SERVER['PHP_AUTH_PW'] ) ) {
+        return array(
+            'username' => wp_unslash( (string) $_SERVER['PHP_AUTH_USER'] ),
+            'password' => wp_unslash( (string) $_SERVER['PHP_AUTH_PW'] ),
+        );
+    }
+
+    foreach ( array( 'HTTP_AUTHORIZATION', 'REDIRECT_HTTP_AUTHORIZATION' ) as $header_key ) {
+        if ( empty( $_SERVER[ $header_key ] ) ) {
+            continue;
+        }
+
+        $raw_header = trim( (string) $_SERVER[ $header_key ] );
+        if ( ! preg_match( '/^Basic\s+(.+)$/i', $raw_header, $matches ) ) {
+            continue;
+        }
+
+        $decoded = base64_decode( (string) $matches[1], true );
+        if ( ! is_string( $decoded ) || strpos( $decoded, ':' ) === false ) {
+            return array();
+        }
+
+        list( $username, $password ) = explode( ':', $decoded, 2 );
+
+        return array(
+            'username' => $username,
+            'password' => $password,
+        );
+    }
+
+    return array();
+}
+
+function anchor_temp_admin_automation_clear_auth_runtime_state() {
+    unset( $GLOBALS['anchor_temp_admin_automation_auth_error'] );
+    unset( $GLOBALS['anchor_temp_admin_automation_auth_mode'] );
+}
+
+function anchor_temp_admin_automation_auth_error( $code, $message, $status ) {
+    return new WP_Error( $code, $message, array( 'status' => (int) $status ) );
+}
+
+function anchor_temp_admin_automation_determine_current_user( $user_id ) {
+    if ( ! empty( $user_id ) ) {
+        return $user_id;
+    }
+
+    anchor_temp_admin_automation_clear_auth_runtime_state();
+
+    if ( ! anchor_temp_admin_automation_is_lock_route() ) {
+        return $user_id;
+    }
+
+    $credentials = anchor_temp_admin_automation_get_basic_auth_credentials();
+    if ( empty( $credentials['username'] ) && empty( $credentials['password'] ) ) {
+        return $user_id;
+    }
+
+    if ( ! anchor_temp_admin_automation_password_auth_is_allowed() ) {
+        $GLOBALS['anchor_temp_admin_automation_auth_error'] = anchor_temp_admin_automation_auth_error(
+            'anchor_temp_admin_automation_auth_requires_https',
+            __( 'Anchor automation lock password authentication requires HTTPS, except in local development.', 'anchor' ),
+            403
+        );
+        return $user_id;
+    }
+
+    $authenticated = wp_authenticate( (string) $credentials['username'], (string) $credentials['password'] );
+    if ( $authenticated instanceof WP_User ) {
+        $GLOBALS['anchor_temp_admin_automation_auth_mode'] = 'basic_password';
+        return (int) $authenticated->ID;
+    }
+
+    $message = $authenticated instanceof WP_Error
+        ? $authenticated->get_error_message()
+        : __( 'Unable to authenticate this Anchor automation lock request.', 'anchor' );
+
+    $GLOBALS['anchor_temp_admin_automation_auth_error'] = anchor_temp_admin_automation_auth_error(
+        'anchor_temp_admin_automation_invalid_basic_credentials',
+        $message,
+        401
+    );
+
+    return $user_id;
+}
+add_filter( 'determine_current_user', 'anchor_temp_admin_automation_determine_current_user', 30 );
+
+function anchor_temp_admin_automation_authentication_errors( $result ) {
+    if ( ! empty( $result ) || ! anchor_temp_admin_automation_is_lock_route() ) {
+        return $result;
+    }
+
+    $auth_error = isset( $GLOBALS['anchor_temp_admin_automation_auth_error'] )
+        ? $GLOBALS['anchor_temp_admin_automation_auth_error']
+        : null;
+
+    return $auth_error instanceof WP_Error ? $auth_error : $result;
+}
+add_filter( 'rest_authentication_errors', 'anchor_temp_admin_automation_authentication_errors' );
+
+function anchor_temp_admin_automation_is_expired_lease( $lease ) {
+    return ! is_array( $lease ) || (int) ( $lease['expires_at'] ?? 0 ) <= time();
+}
+
+function anchor_temp_admin_automation_sanitize_task( $task ) {
+    $task = sanitize_text_field( (string) $task );
+    $task = trim( $task );
+
+    return substr( $task, 0, 180 );
+}
+
+function anchor_temp_admin_automation_normalize_lease( $lease ) {
+    if ( ! is_array( $lease ) || empty( $lease['lease_id'] ) || empty( $lease['owner_user_id'] ) ) {
+        return array();
+    }
+
+    return array(
+        'lease_id'         => sanitize_text_field( (string) $lease['lease_id'] ),
+        'owner_user_id'    => (int) $lease['owner_user_id'],
+        'owner_user_login' => sanitize_user( (string) ( $lease['owner_user_login'] ?? '' ), true ),
+        'owner_label'      => sanitize_text_field( (string) ( $lease['owner_label'] ?? '' ) ),
+        'task'             => anchor_temp_admin_automation_sanitize_task( $lease['task'] ?? '' ),
+        'mode'             => sanitize_key( (string) ( $lease['mode'] ?? '' ) ),
+        'ip'               => sanitize_text_field( (string) ( $lease['ip'] ?? '' ) ),
+        'user_agent'       => substr( sanitize_text_field( (string) ( $lease['user_agent'] ?? '' ) ), 0, 220 ),
+        'created_at'       => (int) ( $lease['created_at'] ?? 0 ),
+        'last_seen'        => (int) ( $lease['last_seen'] ?? 0 ),
+        'expires_at'       => (int) ( $lease['expires_at'] ?? 0 ),
+        'ttl_seconds'      => max( 60, (int) ( $lease['ttl_seconds'] ?? anchor_temp_admin_automation_lease_ttl() ) ),
+    );
+}
+
+function anchor_temp_admin_automation_public_lease( $lease ) {
+    $lease = anchor_temp_admin_automation_normalize_lease( $lease );
+    if ( empty( $lease ) ) {
+        return null;
+    }
+
+    $lease['created_at_iso'] = anchor_temp_admin_automation_datetime( $lease['created_at'] );
+    $lease['last_seen_iso']  = anchor_temp_admin_automation_datetime( $lease['last_seen'] );
+    $lease['expires_at_iso'] = anchor_temp_admin_automation_datetime( $lease['expires_at'] );
+    $lease['expired']        = anchor_temp_admin_automation_is_expired_lease( $lease );
+
+    return $lease;
+}
+
+function anchor_temp_admin_automation_get_lease( $include_expired = false ) {
+    $lease = anchor_temp_admin_automation_normalize_lease( get_option( ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION, array() ) );
+    if ( empty( $lease ) ) {
+        return array();
+    }
+
+    if ( anchor_temp_admin_automation_is_expired_lease( $lease ) ) {
+        if ( ! $include_expired ) {
+            anchor_temp_admin_automation_release_lease( 'expired', 0, true );
+            return array();
+        }
+    }
+
+    return $lease;
+}
+
+function anchor_temp_admin_automation_current_user_can_force_release() {
+    return current_user_can( 'manage_options' ) && ! anchor_is_temp_admin_user();
+}
+
+function anchor_temp_admin_automation_release_lease( $reason = 'released', $actor_user_id = 0, $force = false ) {
+    $lease = anchor_temp_admin_automation_normalize_lease( get_option( ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION, array() ) );
+    if ( empty( $lease ) ) {
+        return false;
+    }
+
+    $actor_user_id = (int) $actor_user_id;
+    if ( ! $force && $actor_user_id > 0 && (int) $lease['owner_user_id'] !== $actor_user_id ) {
+        return new WP_Error(
+            'anchor_temp_admin_automation_lock_owned_by_other_user',
+            __( 'This automation lease is owned by another temporary admin.', 'anchor' ),
+            array( 'status' => 423, 'lease' => anchor_temp_admin_automation_public_lease( $lease ) )
+        );
+    }
+
+    delete_option( ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION );
+
+    anchor_log_temp_admin_event(
+        'automation_lease_released',
+        sprintf(
+            'Released automation lease %1$s for temp admin %2$s. Reason: %3$s.',
+            $lease['lease_id'],
+            $lease['owner_user_login'],
+            sanitize_key( $reason )
+        ),
+        array(
+            'actor_user_id'      => $actor_user_id,
+            'subject_user_id'    => (int) $lease['owner_user_id'],
+            'subject_user_login' => $lease['owner_user_login'],
+            'ip'                 => $lease['ip'],
+        )
+    );
+
+    return $lease;
+}
+
+function anchor_temp_admin_automation_build_lease( $user, $task = '', $mode = 'explicit' ) {
+    $ttl = anchor_temp_admin_automation_lease_ttl();
+    $now = time();
+
+    return array(
+        'lease_id'         => function_exists( 'wp_generate_uuid4' ) ? wp_generate_uuid4() : wp_generate_password( 24, false, false ),
+        'owner_user_id'    => (int) $user->ID,
+        'owner_user_login' => (string) $user->user_login,
+        'owner_label'      => anchor_get_temp_admin_label( $user->ID ),
+        'task'             => anchor_temp_admin_automation_sanitize_task( $task ),
+        'mode'             => sanitize_key( $mode ),
+        'ip'               => anchor_temp_admin_request_ip(),
+        'user_agent'       => substr( sanitize_text_field( (string) ( $_SERVER['HTTP_USER_AGENT'] ?? '' ) ), 0, 220 ),
+        'created_at'       => $now,
+        'last_seen'        => $now,
+        'expires_at'       => $now + $ttl,
+        'ttl_seconds'      => $ttl,
+    );
+}
+
+function anchor_temp_admin_automation_locked_error( $lease ) {
+    return new WP_Error(
+        'anchor_temp_admin_automation_locked',
+        __( 'Another temporary admin currently holds the Anchor automation lease. Stop and wait or ask the site owner to release it.', 'anchor' ),
+        array(
+            'status' => 423,
+            'lease'  => anchor_temp_admin_automation_public_lease( $lease ),
+        )
+    );
+}
+
+function anchor_temp_admin_automation_acquire_lease( $task = '', $user = null, $mode = 'explicit' ) {
+    $user = anchor_get_temp_admin_user( $user );
+    if ( ! $user instanceof WP_User || ! anchor_is_temp_admin_user( $user ) ) {
+        return new WP_Error(
+            'anchor_temp_admin_automation_requires_temp_admin',
+            __( 'Only Anchor temporary admin accounts can acquire an automation lease.', 'anchor' ),
+            array( 'status' => 403 )
+        );
+    }
+
+    if ( anchor_temp_admin_is_expired( $user ) ) {
+        return new WP_Error(
+            'anchor_temp_admin_automation_temp_admin_expired',
+            __( 'This temporary admin account has expired.', 'anchor' ),
+            array( 'status' => 403 )
+        );
+    }
+
+    $existing = anchor_temp_admin_automation_get_lease( false );
+    if ( ! empty( $existing ) ) {
+        if ( (int) $existing['owner_user_id'] === (int) $user->ID ) {
+            return anchor_temp_admin_automation_heartbeat_lease( $user );
+        }
+
+        return anchor_temp_admin_automation_locked_error( $existing );
+    }
+
+    $lease = anchor_temp_admin_automation_build_lease( $user, $task, $mode );
+    $added = add_option( ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION, $lease, '', 'no' );
+
+    if ( ! $added ) {
+        $existing = anchor_temp_admin_automation_get_lease( false );
+        if ( ! empty( $existing ) ) {
+            if ( (int) $existing['owner_user_id'] === (int) $user->ID ) {
+                return anchor_temp_admin_automation_heartbeat_lease( $user );
+            }
+
+            return anchor_temp_admin_automation_locked_error( $existing );
+        }
+
+        $added = add_option( ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION, $lease, '', 'no' );
+        if ( ! $added ) {
+            return new WP_Error(
+                'anchor_temp_admin_automation_acquire_failed',
+                __( 'Anchor could not acquire the automation lease. Retry shortly.', 'anchor' ),
+                array( 'status' => 409 )
+            );
+        }
+    }
+
+    anchor_log_temp_admin_event(
+        'automation_lease_acquired',
+        sprintf(
+            'Acquired automation lease %1$s for temp admin %2$s.',
+            $lease['lease_id'],
+            $user->user_login
+        ),
+        array(
+            'subject_user_id'    => (int) $user->ID,
+            'subject_user_login' => $user->user_login,
+            'ip'                 => $lease['ip'],
+        )
+    );
+
+    return anchor_temp_admin_automation_normalize_lease( $lease );
+}
+
+function anchor_temp_admin_automation_heartbeat_lease( $user = null ) {
+    $user = anchor_get_temp_admin_user( $user );
+    if ( ! $user instanceof WP_User || ! anchor_is_temp_admin_user( $user ) ) {
+        return new WP_Error(
+            'anchor_temp_admin_automation_requires_temp_admin',
+            __( 'Only Anchor temporary admin accounts can heartbeat an automation lease.', 'anchor' ),
+            array( 'status' => 403 )
+        );
+    }
+
+    $lease = anchor_temp_admin_automation_get_lease( false );
+    if ( empty( $lease ) ) {
+        return new WP_Error(
+            'anchor_temp_admin_automation_no_active_lock',
+            __( 'There is no active Anchor automation lease.', 'anchor' ),
+            array( 'status' => 404 )
+        );
+    }
+
+    if ( (int) $lease['owner_user_id'] !== (int) $user->ID ) {
+        return anchor_temp_admin_automation_locked_error( $lease );
+    }
+
+    $now = time();
+    $lease['last_seen']  = $now;
+    $lease['expires_at'] = $now + anchor_temp_admin_automation_lease_ttl();
+    $lease['ip']         = anchor_temp_admin_request_ip();
+    update_option( ANCHOR_TEMP_ADMIN_AUTOMATION_LEASE_OPTION, $lease, false );
+
+    return anchor_temp_admin_automation_normalize_lease( $lease );
+}
+
+function anchor_temp_admin_automation_heartbeat_owned_lease( $user = null ) {
+    $user = anchor_get_temp_admin_user( $user );
+    if ( ! $user instanceof WP_User || ! anchor_is_temp_admin_user( $user ) ) {
+        return false;
+    }
+
+    $lease = anchor_temp_admin_automation_get_lease( false );
+    if ( empty( $lease ) || (int) $lease['owner_user_id'] !== (int) $user->ID ) {
+        return false;
+    }
+
+    return anchor_temp_admin_automation_heartbeat_lease( $user );
+}
+
+function anchor_temp_admin_automation_ensure_current_user_lease( $task = '', $mode = 'auto' ) {
+    $user = is_user_logged_in() ? wp_get_current_user() : null;
+    if ( ! $user instanceof WP_User || ! anchor_is_temp_admin_user( $user ) ) {
+        return true;
+    }
+
+    $lease = anchor_temp_admin_automation_get_lease( false );
+    if ( ! empty( $lease ) ) {
+        if ( (int) $lease['owner_user_id'] !== (int) $user->ID ) {
+            return anchor_temp_admin_automation_locked_error( $lease );
+        }
+
+        return anchor_temp_admin_automation_heartbeat_lease( $user );
+    }
+
+    return anchor_temp_admin_automation_acquire_lease( $task, $user, $mode );
+}
+
+function anchor_temp_admin_automation_rest_permission() {
+    if ( ! is_user_logged_in() ) {
+        return anchor_temp_admin_automation_auth_error(
+            'anchor_temp_admin_automation_auth_required',
+            __( 'Authenticate before calling the Anchor automation lease endpoint.', 'anchor' ),
+            rest_authorization_required_code()
+        );
+    }
+
+    if ( anchor_is_temp_admin_user() || anchor_temp_admin_automation_current_user_can_force_release() ) {
+        return true;
+    }
+
+    return anchor_temp_admin_automation_auth_error(
+        'anchor_temp_admin_automation_forbidden',
+        __( 'You are not allowed to use the Anchor automation lease endpoint.', 'anchor' ),
+        403
+    );
+}
+
+function anchor_temp_admin_automation_status_response() {
+    $lease = anchor_temp_admin_automation_get_lease( false );
+    $user  = is_user_logged_in() ? wp_get_current_user() : null;
+
+    return array(
+        'locked'                 => ! empty( $lease ),
+        'lease'                  => ! empty( $lease ) ? anchor_temp_admin_automation_public_lease( $lease ) : null,
+        'owned_by_current_user'  => ! empty( $lease ) && $user instanceof WP_User && (int) $lease['owner_user_id'] === (int) $user->ID,
+        'current_user_is_temp_admin' => $user instanceof WP_User && anchor_is_temp_admin_user( $user ),
+        'ttl_seconds'            => anchor_temp_admin_automation_lease_ttl(),
+        'auth_mode'              => isset( $GLOBALS['anchor_temp_admin_automation_auth_mode'] ) ? (string) $GLOBALS['anchor_temp_admin_automation_auth_mode'] : ( is_user_logged_in() ? 'cookie_or_default' : 'none' ),
+        'routes'                 => array(
+            'status'    => anchor_temp_admin_automation_lock_base_route() . '/status',
+            'acquire'   => anchor_temp_admin_automation_lock_base_route() . '/acquire',
+            'heartbeat' => anchor_temp_admin_automation_lock_base_route() . '/heartbeat',
+            'release'   => anchor_temp_admin_automation_lock_base_route() . '/release',
+        ),
+    );
+}
+
+function anchor_temp_admin_automation_rest_status( WP_REST_Request $request ) {
+    unset( $request );
+
+    return rest_ensure_response( anchor_temp_admin_automation_status_response() );
+}
+
+function anchor_temp_admin_automation_rest_acquire( WP_REST_Request $request ) {
+    $task = anchor_temp_admin_automation_sanitize_task( $request->get_param( 'task' ) );
+    if ( '' === $task ) {
+        $task = anchor_temp_admin_automation_sanitize_task( $request->get_param( 'holder' ) );
+    }
+
+    $lease = anchor_temp_admin_automation_acquire_lease( $task, wp_get_current_user(), 'rest' );
+    if ( is_wp_error( $lease ) ) {
+        return $lease;
+    }
+
+    return new WP_REST_Response(
+        array(
+            'ok'     => true,
+            'status' => anchor_temp_admin_automation_status_response(),
+        ),
+        200
+    );
+}
+
+function anchor_temp_admin_automation_rest_heartbeat( WP_REST_Request $request ) {
+    unset( $request );
+
+    $lease = anchor_temp_admin_automation_heartbeat_lease( wp_get_current_user() );
+    if ( is_wp_error( $lease ) ) {
+        return $lease;
+    }
+
+    return rest_ensure_response(
+        array(
+            'ok'     => true,
+            'status' => anchor_temp_admin_automation_status_response(),
+        )
+    );
+}
+
+function anchor_temp_admin_automation_rest_release( WP_REST_Request $request ) {
+    $force = rest_sanitize_boolean( $request->get_param( 'force' ) );
+    $force = $force && anchor_temp_admin_automation_current_user_can_force_release();
+
+    $released = anchor_temp_admin_automation_release_lease( 'released_by_rest', get_current_user_id(), $force );
+    if ( is_wp_error( $released ) ) {
+        return $released;
+    }
+
+    return rest_ensure_response(
+        array(
+            'ok'       => true,
+            'released' => ! empty( $released ),
+            'status'   => anchor_temp_admin_automation_status_response(),
+        )
+    );
+}
+
+function anchor_temp_admin_automation_register_rest_routes() {
+    register_rest_route(
+        'anchor/v1',
+        '/automation-lock/status',
+        array(
+            'methods'             => 'GET',
+            'callback'            => 'anchor_temp_admin_automation_rest_status',
+            'permission_callback' => 'anchor_temp_admin_automation_rest_permission',
+        )
+    );
+
+    foreach ( array( 'acquire', 'heartbeat', 'release' ) as $action ) {
+        register_rest_route(
+            'anchor/v1',
+            '/automation-lock/' . $action,
+            array(
+                'methods'             => 'POST',
+                'callback'            => 'anchor_temp_admin_automation_rest_' . $action,
+                'permission_callback' => 'anchor_temp_admin_automation_rest_permission',
+            )
+        );
+    }
+}
+add_action( 'rest_api_init', 'anchor_temp_admin_automation_register_rest_routes' );
+
+function anchor_temp_admin_automation_request_is_write_method() {
+    $method = isset( $_SERVER['REQUEST_METHOD'] ) ? strtoupper( (string) $_SERVER['REQUEST_METHOD'] ) : 'GET';
+
+    return in_array( $method, array( 'POST', 'PUT', 'PATCH', 'DELETE' ), true );
+}
+
+function anchor_temp_admin_automation_rest_guard( $response, array $handler, WP_REST_Request $request ) {
+    unset( $handler );
+
+    if ( ! empty( $response ) || ! is_user_logged_in() || ! anchor_is_temp_admin_user() ) {
+        return $response;
+    }
+
+    $route = (string) $request->get_route();
+    if ( $route === anchor_temp_admin_automation_lock_base_route() || strpos( $route, anchor_temp_admin_automation_lock_base_route() . '/' ) === 0 ) {
+        return $response;
+    }
+
+    $method = strtoupper( (string) $request->get_method() );
+    if ( ! in_array( $method, array( 'POST', 'PUT', 'PATCH', 'DELETE' ), true ) ) {
+        anchor_temp_admin_automation_heartbeat_owned_lease();
+        return $response;
+    }
+
+    $lease = anchor_temp_admin_automation_ensure_current_user_lease(
+        sprintf( 'REST %1$s %2$s', $method, $route ),
+        'rest_auto'
+    );
+
+    return is_wp_error( $lease ) ? $lease : $response;
+}
+add_filter( 'rest_request_before_callbacks', 'anchor_temp_admin_automation_rest_guard', 4, 3 );
+
+function anchor_temp_admin_automation_admin_guard() {
+    if ( ! is_admin() || ! is_user_logged_in() || ! anchor_is_temp_admin_user() ) {
+        return;
+    }
+
+    if ( ! anchor_temp_admin_automation_request_is_write_method() ) {
+        anchor_temp_admin_automation_heartbeat_owned_lease();
+        return;
+    }
+
+    $lease = anchor_temp_admin_automation_ensure_current_user_lease( 'WordPress admin write request', 'admin_auto' );
+    if ( ! is_wp_error( $lease ) ) {
+        return;
+    }
+
+    $lease_data = $lease->get_error_data();
+    $active     = is_array( $lease_data ) && ! empty( $lease_data['lease'] ) && is_array( $lease_data['lease'] ) ? $lease_data['lease'] : array();
+    $message    = $lease->get_error_message();
+    if ( ! empty( $active['owner_user_login'] ) ) {
+        $message .= ' ' . sprintf(
+            'Current holder: %1$s; task: %2$s; last seen: %3$s; expires: %4$s.',
+            $active['owner_user_login'],
+            $active['task'] ? $active['task'] : '-',
+            $active['last_seen_iso'] ? $active['last_seen_iso'] : '-',
+            $active['expires_at_iso'] ? $active['expires_at_iso'] : '-'
+        );
+    }
+
+    wp_die( esc_html( $message ), esc_html__( 'Anchor automation lease active', 'anchor' ), array( 'response' => 423 ) );
+}
+add_action( 'admin_init', 'anchor_temp_admin_automation_admin_guard', 1 );
+
+function anchor_temp_admin_automation_admin_notice() {
+    if ( ! is_admin() || ! is_user_logged_in() || ! anchor_is_temp_admin_user() ) {
+        return;
+    }
+
+    $lease = anchor_temp_admin_automation_get_lease( false );
+    if ( empty( $lease ) ) {
+        echo '<div class="notice notice-warning"><p>' . esc_html__( 'Anchor automation lease: no active lease yet. The first write request will acquire one automatically, or acquire it explicitly before live-site work.', 'anchor' ) . '</p></div>';
+        return;
+    }
+
+    if ( (int) $lease['owner_user_id'] === get_current_user_id() ) {
+        echo '<div class="notice notice-info"><p>' . esc_html(
+            sprintf(
+                'Anchor automation lease active for this temp admin. Task: %1$s. Expires after idle timeout at %2$s.',
+                $lease['task'] ? $lease['task'] : '-',
+                anchor_temp_admin_automation_datetime( $lease['expires_at'] )
+            )
+        ) . '</p></div>';
+        return;
+    }
+
+    echo '<div class="notice notice-error"><p>' . esc_html(
+        sprintf(
+            'Anchor automation lease is held by %1$s. Writes are blocked until it is released or expires at %2$s.',
+            $lease['owner_user_login'],
+            anchor_temp_admin_automation_datetime( $lease['expires_at'] )
+        )
+    ) . '</p></div>';
+}
+add_action( 'admin_notices', 'anchor_temp_admin_automation_admin_notice' );
+
 function anchor_temp_admin_credentials_text( $created_account ) {
     if ( ! is_array( $created_account ) ) {
         return '';
@@ -824,6 +1510,17 @@ function anchor_temp_admin_credentials_text( $created_account ) {
     if ( ! empty( $created_account['wordfence_allowlist']['ip'] ) ) {
         $lines[] = 'Wordfence allowlisted IP: ' . sanitize_text_field( $created_account['wordfence_allowlist']['ip'] );
     }
+
+    $lines[] = '';
+    $lines[] = 'Anchor automation lease instructions for Codex';
+    $lines[] = 'Use these credentials for one Codex session only. Do not share or reuse them in another session.';
+    $lines[] = 'Before live-site admin writes, REST writes, imports, uploads, or cache purges, acquire the server-side lease.';
+    $lines[] = 'Acquire: POST ' . anchor_temp_admin_automation_lock_rest_url( '/acquire' ) . ' with Basic Auth and JSON {"task":"<short task description>"}';
+    $lines[] = 'Status: GET ' . anchor_temp_admin_automation_lock_rest_url( '/status' ) . ' with Basic Auth';
+    $lines[] = 'Heartbeat: POST ' . anchor_temp_admin_automation_lock_rest_url( '/heartbeat' ) . ' every 5-10 minutes during long work, or rely on authenticated activity to renew it.';
+    $lines[] = 'Release: POST ' . anchor_temp_admin_automation_lock_rest_url( '/release' ) . ' when finished, then log out of WordPress.';
+    $lines[] = 'If acquire or any write returns 423/locked, stop and report the lock holder, task, last_seen, and expires_at from the response.';
+    $lines[] = 'If you release the lease and later need more live-site writes, acquire it again first.';
 
     return implode( "\n", array_map( 'sanitize_text_field', $lines ) );
 }
@@ -966,6 +1663,11 @@ function anchor_temp_admin_delete_account( $user_id, $reason = 'expired' ) {
     require_once ABSPATH . 'wp-admin/includes/user.php';
 
     anchor_temp_admin_wordfence_cleanup_for_user( $user );
+
+    $lease = anchor_temp_admin_automation_get_lease( true );
+    if ( ! empty( $lease ) && (int) $lease['owner_user_id'] === (int) $user->ID ) {
+        anchor_temp_admin_automation_release_lease( 'temp_admin_deleted', $actor_user instanceof WP_User ? (int) $actor_user->ID : 0, true );
+    }
 
     $reassign = anchor_temp_admin_reassign_user_id( $user->ID );
     $deleted  = $reassign > 0 ? wp_delete_user( $user->ID, $reassign ) : wp_delete_user( $user->ID );
@@ -1168,6 +1870,8 @@ function anchor_temp_admin_log_logout() {
     if ( ! $user instanceof WP_User || ! anchor_is_temp_admin_user( $user ) ) {
         return;
     }
+
+    anchor_temp_admin_automation_release_lease( 'logout', (int) $user->ID, false );
 
     anchor_log_temp_admin_event(
         'logout',
@@ -1435,6 +2139,8 @@ function anchor_temp_admin_event_label( $event ) {
         'content_saved'      => 'Content Saved',
         'content_trashed'    => 'Content Trashed',
         'content_deleted'    => 'Content Deleted',
+        'automation_lease_acquired' => 'Automation Lease Acquired',
+        'automation_lease_released' => 'Automation Lease Released',
         'wordfence_ip_allowlisted' => 'Wordfence IP Allowlisted',
         'wordfence_ip_allowlist_failed' => 'Wordfence IP Allowlist Failed',
         'wordfence_ip_allowlist_removed' => 'Wordfence IP Removed',
@@ -1541,9 +2247,66 @@ function anchor_handle_temp_admin_action( $action ) {
                 );
             }
             break;
+
+        case 'release_automation_lease':
+            $released = anchor_temp_admin_automation_release_lease(
+                'released_by_admin',
+                get_current_user_id(),
+                anchor_temp_admin_automation_current_user_can_force_release()
+            );
+
+            if ( is_wp_error( $released ) ) {
+                $result['notices'][] = array(
+                    'type'    => 'error',
+                    'message' => $released->get_error_message(),
+                );
+            } elseif ( empty( $released ) ) {
+                $result['notices'][] = array(
+                    'type'    => 'warning',
+                    'message' => 'There is no active automation lease to release.',
+                );
+            } else {
+                $result['notices'][] = array(
+                    'type'    => 'success',
+                    'message' => 'Automation lease released.',
+                );
+            }
+            break;
     }
 
     return $result;
+}
+
+function anchor_render_temp_admin_automation_lease_section( $nonce_action, $nonce_name ) {
+    $lease = anchor_temp_admin_automation_get_lease( false );
+
+    echo '<h3>Automation Lease</h3>';
+    echo '<p class="description" style="max-width: 1100px;">Anchor allows only one temporary admin to hold live-site write access at a time. Temp-admin writes acquire or renew this server-side lease automatically; Codex agents should still acquire explicitly and release it when finished.</p>';
+
+    if ( empty( $lease ) ) {
+        echo '<p><em>No active automation lease.</em></p>';
+        return;
+    }
+
+    echo '<table class="widefat striped" style="max-width: 1100px;">';
+    echo '<thead><tr>';
+    echo '<th>Holder</th><th>Label</th><th>Task</th><th>Started</th><th>Last seen</th><th>Expires</th><th>Mode</th><th>Action</th>';
+    echo '</tr></thead><tbody><tr>';
+    echo '<td><code>' . esc_html( $lease['owner_user_login'] ) . '</code></td>';
+    echo '<td>' . esc_html( $lease['owner_label'] ? $lease['owner_label'] : '-' ) . '</td>';
+    echo '<td>' . esc_html( $lease['task'] ? $lease['task'] : '-' ) . '</td>';
+    echo '<td>' . esc_html( anchor_format_datetime( $lease['created_at'] ) ) . '</td>';
+    echo '<td>' . esc_html( anchor_format_datetime( $lease['last_seen'] ) ) . '</td>';
+    echo '<td>' . esc_html( anchor_format_datetime( $lease['expires_at'] ) ) . '</td>';
+    echo '<td>' . esc_html( $lease['mode'] ? $lease['mode'] : '-' ) . '</td>';
+    echo '<td>';
+    echo '<form method="post">';
+    wp_nonce_field( $nonce_action, $nonce_name );
+    echo '<input type="hidden" name="anchor_action" value="release_automation_lease">';
+    submit_button( 'Force Release', 'secondary', 'submit', false );
+    echo '</form>';
+    echo '</td>';
+    echo '</tr></tbody></table>';
 }
 
 function anchor_render_temp_admin_section( $nonce_action, $nonce_name, $created_account = null ) {
@@ -1637,6 +2400,8 @@ function anchor_render_temp_admin_section( $nonce_action, $nonce_name, $created_
         }());
         </script>';
     }
+
+    anchor_render_temp_admin_automation_lease_section( $nonce_action, $nonce_name );
 
     echo '<form method="post" action="">';
     wp_nonce_field( $nonce_action, $nonce_name );

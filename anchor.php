@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.2
+ * Version: 1.2.3
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -299,6 +299,7 @@ function anchor_admin_page() {
 
             case 'create_temp_admin':
             case 'revoke_temp_admin':
+            case 'release_automation_lease':
                 $temp_admin_response = anchor_handle_temp_admin_action( $posted_action );
                 break;
         }
