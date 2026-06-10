@@ -151,6 +151,23 @@ function anchor_cache_governor_is_wp_optimize_active() {
         || class_exists( 'WP_Optimize', false );
 }
 
+function anchor_cache_governor_is_plugin_active( $plugin_file ) {
+    $plugin_file    = (string) $plugin_file;
+    $active_plugins = (array) get_option( 'active_plugins', array() );
+    if ( in_array( $plugin_file, $active_plugins, true ) ) {
+        return true;
+    }
+
+    if ( is_multisite() ) {
+        $network_plugins = (array) get_site_option( 'active_sitewide_plugins', array() );
+        if ( isset( $network_plugins[ $plugin_file ] ) ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 function anchor_cache_governor_get_wpo_config() {
     $config = get_option( 'wpo_cache_config', array() );
 
@@ -255,6 +272,103 @@ function anchor_cache_governor_get_stale_scan_interval() {
     return max( HOUR_IN_SECONDS, min( WEEK_IN_SECONDS, $interval ) );
 }
 
+function anchor_cache_governor_normalize_list_option( $value ) {
+    if ( ! is_array( $value ) ) {
+        $value = array( $value );
+    }
+
+    return array_values(
+        array_filter(
+            array_map(
+                function( $item ) {
+                    return trim( (string) $item );
+                },
+                $value
+            ),
+            function( $item ) {
+                return '' !== $item;
+            }
+        )
+    );
+}
+
+function anchor_cache_governor_merge_list_option( array $existing, array $additions ) {
+    $merged = array();
+    foreach ( array_merge( $existing, $additions ) as $item ) {
+        $item = trim( (string) $item );
+        if ( '' === $item ) {
+            continue;
+        }
+
+        $merged[ $item ] = $item;
+    }
+
+    return array_values( $merged );
+}
+
+function anchor_cache_governor_get_plugin_exception_rules() {
+    $rules = array(
+        'urls'    => array(),
+        'cookies' => array(),
+        'plugins' => array(),
+    );
+
+    $woocommerce_active = anchor_cache_governor_is_plugin_active( 'woocommerce/woocommerce.php' )
+        || class_exists( 'WooCommerce', false )
+        || function_exists( 'WC' );
+
+    if ( $woocommerce_active ) {
+        $rules['plugins'][] = 'woocommerce';
+        $rules['urls'] = array_merge(
+            $rules['urls'],
+            array(
+                '/cart/',
+                '/checkout/',
+                '/my-account/',
+                '/account/',
+                '/wc-api/',
+                '/order-pay/',
+                '/order-received/',
+            )
+        );
+        $rules['cookies'] = array_merge(
+            $rules['cookies'],
+            array(
+                'woocommerce_items_in_cart',
+                'woocommerce_cart_hash',
+                'wp_woocommerce_session_',
+            )
+        );
+    }
+
+    if ( anchor_cache_governor_is_plugin_active( 'easy-digital-downloads/easy-digital-downloads.php' ) ) {
+        $rules['plugins'][] = 'easy-digital-downloads';
+        $rules['urls'] = array_merge(
+            $rules['urls'],
+            array(
+                '/checkout/',
+                '/purchase-confirmation/',
+                '/purchase-history/',
+                '/transaction-failed/',
+            )
+        );
+        $rules['cookies'][] = 'edd_items_in_cart';
+    }
+
+    /**
+     * Filters plugin-aware WPO cache exception rules.
+     *
+     * @param array $rules Exception rules with urls, cookies, and plugin labels.
+     */
+    $rules = apply_filters( 'anchor_cache_governor_plugin_exception_rules', $rules );
+
+    return array(
+        'urls'    => anchor_cache_governor_normalize_list_option( $rules['urls'] ?? array() ),
+        'cookies' => anchor_cache_governor_normalize_list_option( $rules['cookies'] ?? array() ),
+        'plugins' => anchor_cache_governor_normalize_list_option( $rules['plugins'] ?? array() ),
+    );
+}
+
 function anchor_cache_governor_apply_wpo_conservative_profile() {
     if ( ! anchor_cache_governor_is_wp_optimize_active() ) {
         return array(
@@ -277,6 +391,20 @@ function anchor_cache_governor_apply_wpo_conservative_profile() {
     $config['page_cache_length_value']      = $ttl_days;
     $config['page_cache_length_unit']       = 'days';
     $config['page_cache_length']            = $ttl_days * DAY_IN_SECONDS;
+
+    $exception_rules = anchor_cache_governor_get_plugin_exception_rules();
+    if ( ! empty( $exception_rules['urls'] ) ) {
+        $config['cache_exception_urls'] = anchor_cache_governor_merge_list_option(
+            anchor_cache_governor_normalize_list_option( $config['cache_exception_urls'] ?? array() ),
+            $exception_rules['urls']
+        );
+    }
+    if ( ! empty( $exception_rules['cookies'] ) ) {
+        $config['cache_exception_cookies'] = anchor_cache_governor_merge_list_option(
+            anchor_cache_governor_normalize_list_option( $config['cache_exception_cookies'] ?? array() ),
+            $exception_rules['cookies']
+        );
+    }
 
     update_option( 'wpo_cache_config', $config, false );
 
@@ -301,6 +429,7 @@ function anchor_cache_governor_apply_wpo_conservative_profile() {
             'ttl_days' => $ttl_days,
             'changed'  => $changed,
             'cleared'  => $cleared,
+            'plugins'  => $exception_rules['plugins'],
         )
     );
 
@@ -555,6 +684,10 @@ function anchor_cache_governor_diagnose_url( $url ) {
 
     if ( preg_match( '#/(cart|checkout|my-account|account)(?:/|$)#', $path_lc ) ) {
         $reasons[] = 'Commerce/account paths are bypassed.';
+    }
+
+    if ( preg_match( '#/(purchase-confirmation|purchase-history|transaction-failed)(?:/|$)#', $path_lc ) ) {
+        $reasons[] = 'Digital commerce paths are bypassed.';
     }
 
     if ( preg_match( '#/(feed|comments/feed)(?:/|$)#', $path_lc ) ) {
@@ -1249,6 +1382,7 @@ function anchor_cache_governor_get_diagnostics() {
     $queue       = anchor_cache_governor_get_warm_queue();
     $warm_stats  = anchor_cache_governor_get_warm_stats();
     $stale_stats = anchor_cache_governor_get_stale_scan_stats();
+    $exception_rules = anchor_cache_governor_get_plugin_exception_rules();
 
     $ttl_seconds = isset( $config['page_cache_length'] ) ? (int) $config['page_cache_length'] : 0;
     if ( $ttl_seconds <= 0 && isset( $config['page_cache_length_value'], $config['page_cache_length_unit'] ) ) {
@@ -1278,6 +1412,11 @@ function anchor_cache_governor_get_diagnostics() {
         'sitemap_preload'     => anchor_cache_governor_boolish( $config['enable_sitemap_preload'] ?? false ),
         'scheduled_preload'   => anchor_cache_governor_boolish( $config['enable_schedule_preload'] ?? false ),
         'mobile_cache'        => anchor_cache_governor_boolish( $config['enable_mobile_caching'] ?? false ),
+        'cache_exceptions'    => array(
+            'plugin_rules' => $exception_rules,
+            'urls'         => anchor_cache_governor_normalize_list_option( $config['cache_exception_urls'] ?? array() ),
+            'cookies'      => anchor_cache_governor_normalize_list_option( $config['cache_exception_cookies'] ?? array() ),
+        ),
         'preload_cron_count'  => anchor_cache_governor_count_cron_hook( ANCHOR_CACHE_GOVERNOR_WPO_PRELOAD_HOOK ),
         'last_enforced'       => (int) get_option( ANCHOR_CACHE_GOVERNOR_OPTION_LAST_ENFORCED, 0 ),
         'warm_queue'          => array(
@@ -1725,6 +1864,7 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
     $stale_scan = is_array( $diagnostics['stale_scan'] ?? null ) ? $diagnostics['stale_scan'] : array();
     $stale_stats = is_array( $stale_scan['stats'] ?? null ) ? $stale_scan['stats'] : array();
     $recent_events = is_array( $diagnostics['recent_events'] ?? null ) ? $diagnostics['recent_events'] : array();
+    $cache_exceptions = is_array( $diagnostics['cache_exceptions'] ?? null ) ? $diagnostics['cache_exceptions'] : array();
 
     echo '<div class="anchor-section">';
     echo '<h2>Cache Governor</h2>';
@@ -1797,6 +1937,9 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
         echo '<tr><th scope="row">Scheduled/sitemap preload</th><td>' . esc_html( ( $diagnostics['scheduled_preload'] || $diagnostics['sitemap_preload'] ) ? 'Enabled' : 'Disabled' ) . '</td></tr>';
         echo '<tr><th scope="row">Separate mobile cache</th><td>' . esc_html( $diagnostics['mobile_cache'] ? 'Enabled' : 'Disabled' ) . '</td></tr>';
         echo '<tr><th scope="row">Queued WPO preload jobs</th><td>' . esc_html( (string) $diagnostics['preload_cron_count'] ) . '</td></tr>';
+        echo '<tr><th scope="row">Plugin-aware exceptions</th><td>' . esc_html( implode( ', ', (array) ( $cache_exceptions['plugin_rules']['plugins'] ?? array() ) ) ?: 'None detected' ) . '</td></tr>';
+        echo '<tr><th scope="row">WPO exception URLs</th><td><code>' . esc_html( implode( ', ', array_slice( (array) ( $cache_exceptions['urls'] ?? array() ), 0, 12 ) ) ) . '</code></td></tr>';
+        echo '<tr><th scope="row">WPO exception cookies</th><td><code>' . esc_html( implode( ', ', array_slice( (array) ( $cache_exceptions['cookies'] ?? array() ), 0, 12 ) ) ) . '</code></td></tr>';
         echo '<tr><th scope="row">Anchor warm queue</th><td>' . esc_html( (string) ( $warm['length'] ?? 0 ) ) . '</td></tr>';
         echo '<tr><th scope="row">Anchor warm stats</th><td>' . esc_html( sprintf( 'Warmed: %1$d; failed: %2$d', (int) ( $warm_stats['warmed_count'] ?? 0 ), (int) ( $warm_stats['failed_count'] ?? 0 ) ) ) . '</td></tr>';
         echo '<tr><th scope="row">Stale refresh threshold</th><td>' . esc_html( sprintf( '%d days', (int) ( $stale_scan['stale_refresh_days'] ?? 0 ) ) ) . '</td></tr>';
