@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.3
+ * Version: 1.2.4
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -33,6 +33,7 @@ if ( defined( 'ANCHOR_GITHUB_TOKEN' ) && ANCHOR_GITHUB_TOKEN ) {
 $myUpdateChecker->setBranch( 'main' );
 
 require_once plugin_dir_path( __FILE__ ) . 'includes/temp-admins.php';
+require_once plugin_dir_path( __FILE__ ) . 'includes/cache-governor.php';
 
 // -----------------------------------------------------------------------------
 // ** Wordfence Scan Cron Staggering (with real dedupe) **
@@ -297,6 +298,50 @@ function anchor_admin_page() {
                 );
                 break;
 
+            case 'toggle_cache_governor':
+                $enabled = anchor_cache_governor_is_enabled();
+
+                if ( $enabled ) {
+                    update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
+                    $notices[] = array(
+                        'type'    => 'success',
+                        'message' => 'Cache Governor has been disabled.',
+                    );
+                } elseif ( ! anchor_cache_governor_is_wp_optimize_active() ) {
+                    $notices[] = array(
+                        'type'    => 'error',
+                        'message' => 'Cache Governor was not enabled because WP-Optimize is not active on this site.',
+                    );
+                } else {
+                    update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '1', false );
+                    $result = anchor_cache_governor_apply_wpo_conservative_profile();
+                    $notices[] = array(
+                        'type'    => $result['ok'] ? 'success' : 'error',
+                        'message' => $result['ok']
+                            ? $result['message'] . ' Cleared preload jobs: ' . (int) $result['cleared'] . '.'
+                            : 'Cache Governor was enabled, but the WPO profile was not applied: ' . $result['message'],
+                    );
+                }
+                break;
+
+            case 'cache_governor_apply_wpo_profile':
+                $result = anchor_cache_governor_apply_wpo_conservative_profile();
+                $notices[] = array(
+                    'type'    => $result['ok'] ? 'success' : 'error',
+                    'message' => $result['ok']
+                        ? $result['message'] . ' Cleared preload jobs: ' . (int) $result['cleared'] . '.'
+                        : $result['message'],
+                );
+                break;
+
+            case 'cache_governor_clear_wpo_preload':
+                $cleared = anchor_cache_governor_clear_wpo_preload_jobs();
+                $notices[] = array(
+                    'type'    => 'success',
+                    'message' => 'Cleared WP-Optimize preload continuation jobs: ' . (int) $cleared . '.',
+                );
+                break;
+
             case 'create_temp_admin':
             case 'revoke_temp_admin':
             case 'release_automation_lease':
@@ -406,6 +451,7 @@ function anchor_admin_page() {
     echo '</div>'; // wrapper
 
     anchor_render_temp_admin_section( $nonce_action, $nonce_name, $temp_admin_response['created_account'] );
+    anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name );
 
     // Wordfence section
     $wf_enabled = anchor_wf_is_enabled();
@@ -585,6 +631,10 @@ function anchor_activate() {
 
     if ( get_option( 'anchor_wf_stagger_enabled', null ) === null ) {
         update_option( 'anchor_wf_stagger_enabled', '1', false );
+    }
+
+    if ( get_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, null ) === null ) {
+        update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
     }
 
     anchor_temp_admin_schedule_cleanup();
