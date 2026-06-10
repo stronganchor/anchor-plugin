@@ -658,6 +658,54 @@ function anchor_cache_governor_warm_cron_runner() {
 }
 add_action( ANCHOR_CACHE_GOVERNOR_WARM_HOOK, 'anchor_cache_governor_warm_cron_runner' );
 
+function anchor_cache_governor_enqueue_content_change_warm( $post_id, $post, $update ) {
+    unset( $update );
+
+    if ( ! anchor_cache_governor_is_enabled() || ! anchor_cache_governor_is_wp_optimize_active() ) {
+        return;
+    }
+
+    $post_id = (int) $post_id;
+    if ( $post_id <= 0 || wp_is_post_autosave( $post_id ) || wp_is_post_revision( $post_id ) ) {
+        return;
+    }
+
+    if ( ! $post instanceof WP_Post || 'publish' !== $post->post_status ) {
+        return;
+    }
+
+    $post_type = get_post_type_object( $post->post_type );
+    if ( ! $post_type || empty( $post_type->public ) ) {
+        return;
+    }
+
+    $urls = array_filter(
+        array(
+            get_permalink( $post_id ),
+            home_url( '/' ),
+        )
+    );
+
+    if ( ! empty( $post_type->has_archive ) ) {
+        $archive_url = get_post_type_archive_link( $post->post_type );
+        if ( $archive_url ) {
+            $urls[] = $archive_url;
+        }
+    }
+
+    /**
+     * Filters URLs queued after a public post/page is saved.
+     *
+     * @param string[] $urls    Candidate URLs.
+     * @param int      $post_id Saved post ID.
+     * @param WP_Post  $post    Saved post.
+     */
+    $urls = apply_filters( 'anchor_cache_governor_content_change_warm_urls', $urls, $post_id, $post );
+
+    anchor_cache_governor_enqueue_warm_urls( is_array( $urls ) ? $urls : array(), 'content-change' );
+}
+add_action( 'save_post', 'anchor_cache_governor_enqueue_content_change_warm', 30, 3 );
+
 function anchor_cache_governor_get_diagnostics() {
     $config = anchor_cache_governor_get_wpo_config();
     $profile_key = anchor_cache_governor_get_profile_key();

@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.6
+ * Version: 1.2.7
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -14,7 +14,11 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'ANCHOR_VERSION' ) ) {
-    define( 'ANCHOR_VERSION', '1.2.6' );
+    define( 'ANCHOR_VERSION', '1.2.7' );
+}
+
+if ( ! defined( 'ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION' ) ) {
+    define( 'ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION', 'anchor_self_update_was_active' );
 }
 
 // Include the plugin update checker
@@ -633,6 +637,45 @@ add_action( 'admin_init', 'anchor_force_disable_duplicator_summaries', 1 );
 // ** Activation & Deactivation Hooks **
 // -----------------------------------------------------------------------------
 
+function anchor_plugin_basename() {
+    return plugin_basename( __FILE__ );
+}
+
+function anchor_upgrader_touches_self( $hook_data ) {
+    if ( ! is_array( $hook_data ) || ( $hook_data['type'] ?? '' ) !== 'plugin' ) {
+        return false;
+    }
+
+    $self = anchor_plugin_basename();
+
+    if ( isset( $hook_data['plugin'] ) && (string) $hook_data['plugin'] === $self ) {
+        return true;
+    }
+
+    if ( isset( $hook_data['plugins'] ) && is_array( $hook_data['plugins'] ) && in_array( $self, $hook_data['plugins'], true ) ) {
+        return true;
+    }
+
+    return false;
+}
+
+function anchor_mark_self_active_before_upgrade( $response, $hook_data ) {
+    if ( is_wp_error( $response ) || ! anchor_upgrader_touches_self( $hook_data ) ) {
+        return $response;
+    }
+
+    if ( ! function_exists( 'is_plugin_active' ) ) {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    }
+
+    if ( function_exists( 'is_plugin_active' ) && is_plugin_active( anchor_plugin_basename() ) ) {
+        update_option( ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION, '1', false );
+    }
+
+    return $response;
+}
+add_filter( 'upgrader_pre_install', 'anchor_mark_self_active_before_upgrade', 5, 2 );
+
 function anchor_activate() {
     flush_rewrite_rules( true );
     anchor_force_disable_duplicator_summaries();
@@ -656,17 +699,41 @@ function anchor_activate() {
 }
 register_activation_hook( __FILE__, 'anchor_activate' );
 
-add_action( 'upgrader_process_complete', function( $upgrader, $hook_data ) {
-    if (
-        isset( $hook_data['action'], $hook_data['type'], $hook_data['plugins'] )
-        && $hook_data['action']  === 'update'
-        && $hook_data['type']    === 'plugin'
-        && in_array( plugin_basename( __FILE__ ), (array) $hook_data['plugins'], true )
-    ) {
-        anchor_force_disable_duplicator_summaries();
-        anchor_wf_stagger_scan_cron( true );
+function anchor_handle_self_upgrade_complete( $upgrader, $hook_data ) {
+    unset( $upgrader );
+
+    if ( ! isset( $hook_data['action'] ) || 'update' !== $hook_data['action'] || ! anchor_upgrader_touches_self( $hook_data ) ) {
+        return;
     }
-}, 10, 2 );
+
+    anchor_force_disable_duplicator_summaries();
+    anchor_wf_stagger_scan_cron( true );
+
+    if ( get_option( ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION, '0' ) !== '1' ) {
+        return;
+    }
+
+    delete_option( ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION );
+
+    if ( ! function_exists( 'is_plugin_active' ) || ! function_exists( 'activate_plugin' ) ) {
+        require_once ABSPATH . 'wp-admin/includes/plugin.php';
+    }
+
+    $self = anchor_plugin_basename();
+    if ( function_exists( 'is_plugin_active' ) && is_plugin_active( $self ) ) {
+        return;
+    }
+
+    if ( function_exists( 'activate_plugin' ) ) {
+        $activated = activate_plugin( $self, '', false, true );
+        if ( is_wp_error( $activated ) ) {
+            update_option( 'anchor_self_update_reactivation_error', $activated->get_error_message(), false );
+        } else {
+            delete_option( 'anchor_self_update_reactivation_error' );
+        }
+    }
+}
+add_action( 'upgrader_process_complete', 'anchor_handle_self_upgrade_complete', 20, 2 );
 
 function anchor_deactivate() {
     flush_rewrite_rules( true );
@@ -677,5 +744,6 @@ function anchor_deactivate() {
     }
     delete_option( 'anchor_error_reporting_enabled' );
     delete_option( 'anchor_disable_pings_enabled' );
+    delete_option( ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION );
 }
 register_deactivation_hook( __FILE__, 'anchor_deactivate' );
