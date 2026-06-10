@@ -866,11 +866,42 @@ function anchor_temp_admin_automation_get_route_path() {
     return is_string( $route ) ? '/' . ltrim( $route, '/' ) : '';
 }
 
+function anchor_temp_admin_automation_basic_auth_route_bases() {
+    $bases = array( anchor_temp_admin_automation_lock_base_route() );
+
+    /**
+     * Filters Anchor REST route bases that may use temp-admin Basic Auth.
+     *
+     * Routes added here should still perform their own capability and lease
+     * checks. This only controls whether password auth is considered.
+     *
+     * @param string[] $bases REST route bases, including the leading slash.
+     */
+    $bases = apply_filters( 'anchor_temp_admin_automation_basic_auth_route_bases', $bases );
+
+    return array_values(
+        array_filter(
+            array_map(
+                static function( $base ) {
+                    $base = '/' . trim( (string) $base, '/' );
+                    return '/' === $base ? '' : $base;
+                },
+                is_array( $bases ) ? $bases : array()
+            )
+        )
+    );
+}
+
 function anchor_temp_admin_automation_is_lock_route() {
     $route = anchor_temp_admin_automation_get_route_path();
-    $base  = anchor_temp_admin_automation_lock_base_route();
 
-    return $route === $base || strpos( $route, $base . '/' ) === 0;
+    foreach ( anchor_temp_admin_automation_basic_auth_route_bases() as $base ) {
+        if ( $route === $base || strpos( $route, $base . '/' ) === 0 ) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 function anchor_temp_admin_automation_has_local_host_context() {

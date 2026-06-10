@@ -14,6 +14,7 @@ const ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED       = 'anchor_cache_governor_enable
 const ANCHOR_CACHE_GOVERNOR_OPTION_LAST_ENFORCED = 'anchor_cache_governor_last_enforced';
 const ANCHOR_CACHE_GOVERNOR_WPO_PRELOAD_HOOK     = 'wpo_page_cache_preload_continue';
 const ANCHOR_CACHE_GOVERNOR_DEFAULT_TTL_DAYS     = 30;
+const ANCHOR_CACHE_GOVERNOR_REST_BASE_ROUTE      = '/anchor/v1/cache-governor';
 
 function anchor_cache_governor_is_enabled() {
     return get_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0' ) === '1';
@@ -163,6 +164,17 @@ function anchor_cache_governor_maybe_enforce_wpo_profile() {
 }
 add_action( 'init', 'anchor_cache_governor_maybe_enforce_wpo_profile', 20 );
 
+function anchor_cache_governor_allow_basic_auth_route( $bases ) {
+    if ( ! is_array( $bases ) ) {
+        $bases = array();
+    }
+
+    $bases[] = ANCHOR_CACHE_GOVERNOR_REST_BASE_ROUTE;
+
+    return $bases;
+}
+add_filter( 'anchor_temp_admin_automation_basic_auth_route_bases', 'anchor_cache_governor_allow_basic_auth_route' );
+
 function anchor_cache_governor_get_diagnostics() {
     $config = anchor_cache_governor_get_wpo_config();
 
@@ -231,6 +243,148 @@ function anchor_cache_governor_get_diagnostics() {
 
     return $diagnostics;
 }
+
+function anchor_cache_governor_rest_permission() {
+    if ( ! is_user_logged_in() ) {
+        return new WP_Error(
+            'anchor_cache_governor_auth_required',
+            __( 'Authenticate before using the Anchor Cache Governor endpoint.', 'anchor' ),
+            array( 'status' => rest_authorization_required_code() )
+        );
+    }
+
+    if ( function_exists( 'anchor_is_temp_admin_user' ) && anchor_is_temp_admin_user() ) {
+        if (
+            function_exists( 'anchor_temp_admin_automation_get_lease' )
+            && function_exists( 'anchor_temp_admin_automation_heartbeat_owned_lease' )
+        ) {
+            $lease = anchor_temp_admin_automation_get_lease( false );
+            if ( is_array( $lease ) && (int) ( $lease['owner_user_id'] ?? 0 ) === get_current_user_id() ) {
+                anchor_temp_admin_automation_heartbeat_owned_lease();
+                return true;
+            }
+        }
+
+        return new WP_Error(
+            'anchor_cache_governor_lease_required',
+            __( 'A temporary admin must hold the Anchor automation lease before using the Cache Governor endpoint.', 'anchor' ),
+            array( 'status' => 423 )
+        );
+    }
+
+    if ( current_user_can( 'manage_options' ) ) {
+        return true;
+    }
+
+    return new WP_Error(
+        'anchor_cache_governor_forbidden',
+        __( 'You are not allowed to use the Anchor Cache Governor endpoint.', 'anchor' ),
+        array( 'status' => 403 )
+    );
+}
+
+function anchor_cache_governor_rest_status( WP_REST_Request $request ) {
+    unset( $request );
+
+    return rest_ensure_response(
+        array(
+            'ok'          => true,
+            'enabled'     => anchor_cache_governor_is_enabled(),
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
+function anchor_cache_governor_rest_enable( WP_REST_Request $request ) {
+    unset( $request );
+
+    if ( ! anchor_cache_governor_is_wp_optimize_active() ) {
+        return new WP_Error(
+            'anchor_cache_governor_wpo_missing',
+            __( 'WP-Optimize is not active on this site.', 'anchor' ),
+            array( 'status' => 409 )
+        );
+    }
+
+    update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '1', false );
+    $result = anchor_cache_governor_apply_wpo_conservative_profile();
+
+    return rest_ensure_response(
+        array(
+            'ok'          => ! empty( $result['ok'] ),
+            'enabled'     => anchor_cache_governor_is_enabled(),
+            'result'      => $result,
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
+function anchor_cache_governor_rest_disable( WP_REST_Request $request ) {
+    unset( $request );
+
+    update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
+
+    return rest_ensure_response(
+        array(
+            'ok'          => true,
+            'enabled'     => false,
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
+function anchor_cache_governor_rest_apply_wpo_profile( WP_REST_Request $request ) {
+    unset( $request );
+
+    $result = anchor_cache_governor_apply_wpo_conservative_profile();
+
+    return rest_ensure_response(
+        array(
+            'ok'          => ! empty( $result['ok'] ),
+            'result'      => $result,
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
+function anchor_cache_governor_rest_clear_wpo_preload( WP_REST_Request $request ) {
+    unset( $request );
+
+    $cleared = anchor_cache_governor_clear_wpo_preload_jobs();
+
+    return rest_ensure_response(
+        array(
+            'ok'          => true,
+            'cleared'     => $cleared,
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
+function anchor_cache_governor_register_rest_routes() {
+    register_rest_route(
+        'anchor/v1',
+        '/cache-governor/status',
+        array(
+            'methods'             => 'GET',
+            'callback'            => 'anchor_cache_governor_rest_status',
+            'permission_callback' => 'anchor_cache_governor_rest_permission',
+        )
+    );
+
+    foreach ( array( 'enable', 'disable', 'apply-wpo-profile', 'clear-wpo-preload' ) as $action ) {
+        register_rest_route(
+            'anchor/v1',
+            '/cache-governor/' . $action,
+            array(
+                'methods'             => 'POST',
+                'callback'            => 'anchor_cache_governor_rest_' . str_replace( '-', '_', $action ),
+                'permission_callback' => 'anchor_cache_governor_rest_permission',
+            )
+        );
+    }
+}
+add_action( 'rest_api_init', 'anchor_cache_governor_register_rest_routes' );
 
 function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name ) {
     $diagnostics = anchor_cache_governor_get_diagnostics();
