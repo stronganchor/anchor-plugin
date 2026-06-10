@@ -16,6 +16,7 @@ const ANCHOR_CACHE_GOVERNOR_OPTION_PROFILE       = 'anchor_cache_governor_profil
 const ANCHOR_CACHE_GOVERNOR_OPTION_WARM_QUEUE    = 'anchor_cache_governor_warm_queue';
 const ANCHOR_CACHE_GOVERNOR_OPTION_WARM_STATS    = 'anchor_cache_governor_warm_stats';
 const ANCHOR_CACHE_GOVERNOR_OPTION_STALE_STATS   = 'anchor_cache_governor_stale_scan_stats';
+const ANCHOR_CACHE_GOVERNOR_OPTION_EVENT_LOG     = 'anchor_cache_governor_event_log';
 const ANCHOR_CACHE_GOVERNOR_WPO_PRELOAD_HOOK     = 'wpo_page_cache_preload_continue';
 const ANCHOR_CACHE_GOVERNOR_WARM_HOOK            = 'anchor_cache_governor_warm_one_url';
 const ANCHOR_CACHE_GOVERNOR_WARM_LOCK            = 'anchor_cache_governor_warm_lock';
@@ -107,6 +108,7 @@ function anchor_cache_governor_set_profile( $profile ) {
     }
 
     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_PROFILE, $profile, false );
+    anchor_cache_governor_log_event( 'profile_set', array( 'profile' => $profile ) );
 
     return $profile;
 }
@@ -293,6 +295,15 @@ function anchor_cache_governor_apply_wpo_conservative_profile() {
         anchor_cache_governor_schedule_stale_scan( HOUR_IN_SECONDS );
     }
 
+    anchor_cache_governor_log_event(
+        'wpo_profile_applied',
+        array(
+            'ttl_days' => $ttl_days,
+            'changed'  => $changed,
+            'cleared'  => $cleared,
+        )
+    );
+
     return array(
         'ok'      => true,
         'message' => sprintf(
@@ -397,6 +408,100 @@ function anchor_cache_governor_update_stale_scan_stats( array $stats ) {
         array_merge( anchor_cache_governor_get_stale_scan_stats(), $stats ),
         false
     );
+}
+
+function anchor_cache_governor_event_log_limit() {
+    /**
+     * Filters how many Cache Governor events Anchor stores.
+     *
+     * @param int $limit Event count.
+     */
+    $limit = (int) apply_filters( 'anchor_cache_governor_event_log_limit', 100 );
+
+    return max( 10, min( 500, $limit ) );
+}
+
+function anchor_cache_governor_get_event_log( $limit = null ) {
+    $events = get_option( ANCHOR_CACHE_GOVERNOR_OPTION_EVENT_LOG, array() );
+    if ( ! is_array( $events ) ) {
+        return array();
+    }
+
+    $events = array_values(
+        array_filter(
+            $events,
+            function( $event ) {
+                return is_array( $event ) && ! empty( $event['event'] ) && ! empty( $event['time'] );
+            }
+        )
+    );
+
+    usort(
+        $events,
+        function( $a, $b ) {
+            return (int) ( $b['time'] ?? 0 ) <=> (int) ( $a['time'] ?? 0 );
+        }
+    );
+
+    if ( null !== $limit ) {
+        $events = array_slice( $events, 0, max( 0, (int) $limit ) );
+    }
+
+    return $events;
+}
+
+function anchor_cache_governor_sanitize_event_context( array $context ) {
+    $clean = array();
+    foreach ( $context as $key => $value ) {
+        $key = sanitize_key( (string) $key );
+        if ( '' === $key ) {
+            continue;
+        }
+
+        if ( is_bool( $value ) ) {
+            $clean[ $key ] = $value;
+        } elseif ( is_int( $value ) || is_float( $value ) ) {
+            $clean[ $key ] = $value;
+        } elseif ( is_array( $value ) ) {
+            $clean[ $key ] = array_slice(
+                array_map(
+                    function( $item ) {
+                        return is_scalar( $item ) ? sanitize_text_field( (string) $item ) : '';
+                    },
+                    $value
+                ),
+                0,
+                10
+            );
+        } elseif ( null !== $value ) {
+            $clean[ $key ] = sanitize_text_field( (string) $value );
+        }
+    }
+
+    return $clean;
+}
+
+function anchor_cache_governor_log_event( $event, array $context = array() ) {
+    $event = sanitize_key( (string) $event );
+    if ( '' === $event ) {
+        return;
+    }
+
+    $entry = array(
+        'time'    => time(),
+        'event'   => $event,
+        'context' => anchor_cache_governor_sanitize_event_context( $context ),
+    );
+
+    $events = anchor_cache_governor_get_event_log();
+    array_unshift( $events, $entry );
+    $events = array_slice( $events, 0, anchor_cache_governor_event_log_limit() );
+
+    update_option( ANCHOR_CACHE_GOVERNOR_OPTION_EVENT_LOG, $events, false );
+}
+
+function anchor_cache_governor_clear_event_log() {
+    delete_option( ANCHOR_CACHE_GOVERNOR_OPTION_EVENT_LOG );
 }
 
 function anchor_cache_governor_normalize_url( $url ) {
@@ -595,6 +700,17 @@ function anchor_cache_governor_enqueue_warm_urls( array $urls, $source = 'manual
 
     anchor_cache_governor_update_warm_queue( $queue );
     anchor_cache_governor_schedule_warm_runner( MINUTE_IN_SECONDS );
+
+    if ( $added > 0 ) {
+        anchor_cache_governor_log_event(
+            'warm_urls_queued',
+            array(
+                'source'       => sanitize_key( (string) $source ),
+                'added'        => $added,
+                'queue_length' => count( $queue ),
+            )
+        );
+    }
 
     return array(
         'added'        => $added,
@@ -897,6 +1013,18 @@ function anchor_cache_governor_run_stale_scan( $manual = false ) {
     delete_transient( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_LOCK );
     anchor_cache_governor_schedule_stale_scan();
 
+    anchor_cache_governor_log_event(
+        'stale_scan',
+        array(
+            'ok'            => ! empty( $scan['ok'] ),
+            'scanned_files' => (int) ( $scan['scanned_files'] ?? 0 ),
+            'found_count'   => (int) ( $scan['found_count'] ?? 0 ),
+            'queued'        => (int) ( $queued['added'] ?? 0 ),
+            'manual'        => (bool) $manual,
+            'error'         => $error,
+        )
+    );
+
     return array(
         'ok'      => ! empty( $scan['ok'] ),
         'message' => (string) ( $scan['message'] ?? '' ),
@@ -928,6 +1056,13 @@ function anchor_cache_governor_run_warm_step( $manual = false ) {
     $stats = anchor_cache_governor_get_warm_stats();
     if ( ! $manual && ! empty( $stats['paused_until'] ) && (int) $stats['paused_until'] > time() ) {
         anchor_cache_governor_schedule_warm_runner( (int) $stats['paused_until'] - time() );
+        anchor_cache_governor_log_event(
+            'warm_paused',
+            array(
+                'paused_until' => (int) $stats['paused_until'],
+                'queue_length' => count( anchor_cache_governor_get_warm_queue() ),
+            )
+        );
         return array(
             'ok'      => false,
             'message' => 'Warm runner is paused after a recent error.',
@@ -936,6 +1071,12 @@ function anchor_cache_governor_run_warm_step( $manual = false ) {
 
     if ( ! $manual && anchor_cache_governor_server_too_busy() ) {
         anchor_cache_governor_schedule_warm_runner();
+        anchor_cache_governor_log_event(
+            'warm_deferred_load',
+            array(
+                'queue_length' => count( anchor_cache_governor_get_warm_queue() ),
+            )
+        );
         return array(
             'ok'      => false,
             'message' => 'Server load is above the warm queue threshold.',
@@ -960,6 +1101,14 @@ function anchor_cache_governor_run_warm_step( $manual = false ) {
         anchor_cache_governor_update_warm_queue( $queue );
         delete_transient( ANCHOR_CACHE_GOVERNOR_WARM_LOCK );
         anchor_cache_governor_schedule_warm_runner();
+        anchor_cache_governor_log_event(
+            'warm_skipped',
+            array(
+                'url'          => $url,
+                'reason'       => implode( ' ', (array) $diagnosis['reasons'] ),
+                'queue_length' => count( $queue ),
+            )
+        );
 
         return array(
             'ok'      => false,
@@ -1017,6 +1166,18 @@ function anchor_cache_governor_run_warm_step( $manual = false ) {
     if ( ! empty( $queue ) ) {
         anchor_cache_governor_schedule_warm_runner( $next_delay );
     }
+
+    anchor_cache_governor_log_event(
+        $success ? 'warm_succeeded' : 'warm_failed',
+        array(
+            'url'          => $url,
+            'status'       => $status,
+            'error'        => $error,
+            'queue_length' => count( $queue ),
+            'next_delay'   => ! empty( $queue ) ? $next_delay : 0,
+            'manual'       => (bool) $manual,
+        )
+    );
 
     return array(
         'ok'           => $success,
@@ -1134,6 +1295,7 @@ function anchor_cache_governor_get_diagnostics() {
             'root_exists'        => is_dir( anchor_cache_governor_get_wpo_cache_root() ),
             'stats'              => $stale_stats,
         ),
+        'recent_events'       => anchor_cache_governor_get_event_log( 10 ),
     );
 
     $risks = array();
@@ -1242,6 +1404,7 @@ function anchor_cache_governor_rest_enable( WP_REST_Request $request ) {
     }
 
     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '1', false );
+    anchor_cache_governor_log_event( 'governor_enabled', array( 'source' => 'rest' ) );
     $result = anchor_cache_governor_apply_wpo_conservative_profile();
 
     return rest_ensure_response(
@@ -1259,6 +1422,7 @@ function anchor_cache_governor_rest_disable( WP_REST_Request $request ) {
 
     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
     wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK );
+    anchor_cache_governor_log_event( 'governor_disabled', array( 'source' => 'rest' ) );
 
     return rest_ensure_response(
         array(
@@ -1287,6 +1451,13 @@ function anchor_cache_governor_rest_clear_wpo_preload( WP_REST_Request $request 
     unset( $request );
 
     $cleared = anchor_cache_governor_clear_wpo_preload_jobs();
+    anchor_cache_governor_log_event(
+        'wpo_preload_cleared',
+        array(
+            'source'  => 'rest',
+            'cleared' => $cleared,
+        )
+    );
 
     return rest_ensure_response(
         array(
@@ -1367,6 +1538,19 @@ function anchor_cache_governor_rest_scan_stale_cache( WP_REST_Request $request )
     );
 }
 
+function anchor_cache_governor_rest_clear_history( WP_REST_Request $request ) {
+    unset( $request );
+
+    anchor_cache_governor_clear_event_log();
+
+    return rest_ensure_response(
+        array(
+            'ok'          => true,
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
 function anchor_cache_governor_rest_diagnose_url( WP_REST_Request $request ) {
     $url = $request->get_param( 'url' );
 
@@ -1405,7 +1589,7 @@ function anchor_cache_governor_register_rest_routes() {
         )
     );
 
-    foreach ( array( 'enable', 'disable', 'apply-wpo-profile', 'clear-wpo-preload', 'set-profile', 'enqueue-default-warm', 'run-warm-step', 'scan-stale-cache' ) as $action ) {
+    foreach ( array( 'enable', 'disable', 'apply-wpo-profile', 'clear-wpo-preload', 'set-profile', 'enqueue-default-warm', 'run-warm-step', 'scan-stale-cache', 'clear-history' ) as $action ) {
         register_rest_route(
             'anchor/v1',
             '/cache-governor/' . $action,
@@ -1502,6 +1686,14 @@ function anchor_cache_governor_handle_admin_action( $posted_action ) {
             );
             break;
 
+        case 'cache_governor_clear_history':
+            anchor_cache_governor_clear_event_log();
+            $notices[] = array(
+                'type'    => 'success',
+                'message' => 'Cache Governor history cleared.',
+            );
+            break;
+
         case 'cache_governor_diagnose_url':
             $url = isset( $_POST['anchor_cache_governor_diagnose_url'] )
                 ? esc_url_raw( wp_unslash( $_POST['anchor_cache_governor_diagnose_url'] ) )
@@ -1532,6 +1724,7 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
     $warm_stats = is_array( $warm['stats'] ?? null ) ? $warm['stats'] : array();
     $stale_scan = is_array( $diagnostics['stale_scan'] ?? null ) ? $diagnostics['stale_scan'] : array();
     $stale_stats = is_array( $stale_scan['stats'] ?? null ) ? $stale_scan['stats'] : array();
+    $recent_events = is_array( $diagnostics['recent_events'] ?? null ) ? $diagnostics['recent_events'] : array();
 
     echo '<div class="anchor-section">';
     echo '<h2>Cache Governor</h2>';
@@ -1589,6 +1782,12 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
     echo '<input type="submit" class="button button-secondary" value="Scan Stale Cache"' . $warm_disabled . '>';
     echo '</form>';
 
+    echo '<form method="post" action="" style="display:inline-block; margin-left: 12px;">';
+    wp_nonce_field( $nonce_action, $nonce_name );
+    echo '<input type="hidden" name="anchor_action" value="cache_governor_clear_history">';
+    echo '<input type="submit" class="button button-secondary" value="Clear History">';
+    echo '</form>';
+
     if ( $diagnostics['wpo_active'] ) {
         echo '<table class="widefat striped" style="max-width: 900px; margin-top: 14px;">';
         echo '<tbody>';
@@ -1618,6 +1817,26 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
                 ? wp_date( 'Y-m-d H:i:s T', (int) $stale_scan['next_scheduled'] )
                 : date_i18n( 'Y-m-d H:i:s T', (int) $stale_scan['next_scheduled'] );
             echo '<tr><th scope="row">Next stale scan</th><td>' . esc_html( $next_scan_str ) . '</td></tr>';
+        }
+        echo '</tbody></table>';
+    }
+
+    if ( ! empty( $recent_events ) ) {
+        echo '<h3>Recent Cache Governor Events</h3>';
+        echo '<table class="widefat striped" style="max-width: 1100px; margin-top: 8px;">';
+        echo '<thead><tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Context</th></tr></thead>';
+        echo '<tbody>';
+        foreach ( $recent_events as $event ) {
+            $time = (int) ( $event['time'] ?? 0 );
+            $time_str = $time > 0
+                ? ( function_exists( 'wp_date' ) ? wp_date( 'Y-m-d H:i:s T', $time ) : date_i18n( 'Y-m-d H:i:s T', $time ) )
+                : '';
+            $context = isset( $event['context'] ) && is_array( $event['context'] ) ? $event['context'] : array();
+            echo '<tr>';
+            echo '<td>' . esc_html( $time_str ) . '</td>';
+            echo '<td><code>' . esc_html( (string) ( $event['event'] ?? '' ) ) . '</code></td>';
+            echo '<td><code>' . esc_html( wp_json_encode( $context ) ) . '</code></td>';
+            echo '</tr>';
         }
         echo '</tbody></table>';
     }
@@ -1677,6 +1896,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI && class_exists( 'WP_CLI_Command' ) ) {
             }
 
             update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '1', false );
+            anchor_cache_governor_log_event( 'governor_enabled', array( 'source' => 'cli' ) );
             $this->print_json( anchor_cache_governor_apply_wpo_conservative_profile() );
         }
 
@@ -1685,6 +1905,8 @@ if ( defined( 'WP_CLI' ) && WP_CLI && class_exists( 'WP_CLI_Command' ) ) {
          */
         public function disable() {
             update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
+            wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK );
+            anchor_cache_governor_log_event( 'governor_disabled', array( 'source' => 'cli' ) );
             WP_CLI::success( 'Cache Governor disabled.' );
         }
 
@@ -1735,6 +1957,29 @@ if ( defined( 'WP_CLI' ) && WP_CLI && class_exists( 'WP_CLI_Command' ) ) {
          */
         public function scan_stale_cache() {
             $this->print_json( anchor_cache_governor_run_stale_scan( true ) );
+        }
+
+        /**
+         * Show recent Cache Governor events.
+         *
+         * ## OPTIONS
+         *
+         * [--limit=<limit>]
+         * : Number of events to print. Default: 20.
+         */
+        public function history( $args, $assoc_args ) {
+            unset( $args );
+
+            $limit = isset( $assoc_args['limit'] ) ? (int) $assoc_args['limit'] : 20;
+            $this->print_json( anchor_cache_governor_get_event_log( $limit ) );
+        }
+
+        /**
+         * Clear Cache Governor event history.
+         */
+        public function clear_history() {
+            anchor_cache_governor_clear_event_log();
+            WP_CLI::success( 'Cache Governor history cleared.' );
         }
 
         /**

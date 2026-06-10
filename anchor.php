@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.8
+ * Version: 1.2.9
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'ANCHOR_VERSION' ) ) {
-    define( 'ANCHOR_VERSION', '1.2.8' );
+    define( 'ANCHOR_VERSION', '1.2.9' );
 }
 
 if ( ! defined( 'ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION' ) ) {
@@ -312,6 +312,7 @@ function anchor_admin_page() {
                 if ( $enabled ) {
                     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
                     wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK );
+                    anchor_cache_governor_log_event( 'governor_disabled', array( 'source' => 'admin' ) );
                     $notices[] = array(
                         'type'    => 'success',
                         'message' => 'Cache Governor has been disabled.',
@@ -323,6 +324,7 @@ function anchor_admin_page() {
                     );
                 } else {
                     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '1', false );
+                    anchor_cache_governor_log_event( 'governor_enabled', array( 'source' => 'admin' ) );
                     $result = anchor_cache_governor_apply_wpo_conservative_profile();
                     $notices[] = array(
                         'type'    => $result['ok'] ? 'success' : 'error',
@@ -345,6 +347,13 @@ function anchor_admin_page() {
 
             case 'cache_governor_clear_wpo_preload':
                 $cleared = anchor_cache_governor_clear_wpo_preload_jobs();
+                anchor_cache_governor_log_event(
+                    'wpo_preload_cleared',
+                    array(
+                        'source'  => 'admin',
+                        'cleared' => $cleared,
+                    )
+                );
                 $notices[] = array(
                     'type'    => 'success',
                     'message' => 'Cleared WP-Optimize preload continuation jobs: ' . (int) $cleared . '.',
@@ -355,6 +364,7 @@ function anchor_admin_page() {
             case 'cache_governor_enqueue_default_warm':
             case 'cache_governor_run_warm_step':
             case 'cache_governor_scan_stale_cache':
+            case 'cache_governor_clear_history':
             case 'cache_governor_diagnose_url':
                 $notices = array_merge( $notices, anchor_cache_governor_handle_admin_action( $posted_action ) );
                 break;
