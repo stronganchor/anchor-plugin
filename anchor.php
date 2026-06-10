@@ -4,13 +4,17 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.5
+ * Version: 1.2.6
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
 // Exit if accessed directly.
 if ( ! defined( 'ABSPATH' ) ) {
     exit;
+}
+
+if ( ! defined( 'ANCHOR_VERSION' ) ) {
+    define( 'ANCHOR_VERSION', '1.2.6' );
 }
 
 // Include the plugin update checker
@@ -342,6 +346,13 @@ function anchor_admin_page() {
                 );
                 break;
 
+            case 'cache_governor_save_profile':
+            case 'cache_governor_enqueue_default_warm':
+            case 'cache_governor_run_warm_step':
+            case 'cache_governor_diagnose_url':
+                $notices = array_merge( $notices, anchor_cache_governor_handle_admin_action( $posted_action ) );
+                break;
+
             case 'create_temp_admin':
             case 'revoke_temp_admin':
             case 'release_automation_lease':
@@ -636,6 +647,9 @@ function anchor_activate() {
     if ( get_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, null ) === null ) {
         update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
     }
+    if ( get_option( ANCHOR_CACHE_GOVERNOR_OPTION_PROFILE, null ) === null ) {
+        update_option( ANCHOR_CACHE_GOVERNOR_OPTION_PROFILE, 'conservative', false );
+    }
 
     anchor_temp_admin_schedule_cleanup();
     anchor_wf_stagger_scan_cron( true );
@@ -658,6 +672,9 @@ function anchor_deactivate() {
     flush_rewrite_rules( true );
     anchor_temp_admin_delete_all_accounts( 'plugin_deactivated' );
     anchor_temp_admin_unschedule_cleanup();
+    if ( defined( 'ANCHOR_CACHE_GOVERNOR_WARM_HOOK' ) ) {
+        wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_WARM_HOOK );
+    }
     delete_option( 'anchor_error_reporting_enabled' );
     delete_option( 'anchor_disable_pings_enabled' );
 }
