@@ -15,9 +15,12 @@ const ANCHOR_CACHE_GOVERNOR_OPTION_LAST_ENFORCED = 'anchor_cache_governor_last_e
 const ANCHOR_CACHE_GOVERNOR_OPTION_PROFILE       = 'anchor_cache_governor_profile';
 const ANCHOR_CACHE_GOVERNOR_OPTION_WARM_QUEUE    = 'anchor_cache_governor_warm_queue';
 const ANCHOR_CACHE_GOVERNOR_OPTION_WARM_STATS    = 'anchor_cache_governor_warm_stats';
+const ANCHOR_CACHE_GOVERNOR_OPTION_STALE_STATS   = 'anchor_cache_governor_stale_scan_stats';
 const ANCHOR_CACHE_GOVERNOR_WPO_PRELOAD_HOOK     = 'wpo_page_cache_preload_continue';
 const ANCHOR_CACHE_GOVERNOR_WARM_HOOK            = 'anchor_cache_governor_warm_one_url';
 const ANCHOR_CACHE_GOVERNOR_WARM_LOCK            = 'anchor_cache_governor_warm_lock';
+const ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK      = 'anchor_cache_governor_scan_stale_cache';
+const ANCHOR_CACHE_GOVERNOR_STALE_SCAN_LOCK      = 'anchor_cache_governor_stale_scan_lock';
 const ANCHOR_CACHE_GOVERNOR_DEFAULT_TTL_DAYS     = 30;
 const ANCHOR_CACHE_GOVERNOR_REST_BASE_ROUTE      = '/anchor/v1/cache-governor';
 
@@ -32,6 +35,10 @@ function anchor_cache_governor_get_profiles() {
             'failure_delay'    => 15 * MINUTE_IN_SECONDS,
             'max_queue'        => 40,
             'load_limit'       => 4.0,
+            'stale_refresh_days'    => 14,
+            'stale_scan_batch'      => 4,
+            'stale_scan_file_limit' => 500,
+            'stale_scan_interval'   => 6 * HOUR_IN_SECONDS,
         ),
         'archive' => array(
             'label'            => 'Archive-heavy',
@@ -42,6 +49,10 @@ function anchor_cache_governor_get_profiles() {
             'failure_delay'    => 30 * MINUTE_IN_SECONDS,
             'max_queue'        => 60,
             'load_limit'       => 4.0,
+            'stale_refresh_days'    => 21,
+            'stale_scan_batch'      => 5,
+            'stale_scan_file_limit' => 800,
+            'stale_scan_interval'   => 6 * HOUR_IN_SECONDS,
         ),
         'brochure' => array(
             'label'            => 'Brochure',
@@ -52,6 +63,10 @@ function anchor_cache_governor_get_profiles() {
             'failure_delay'    => 15 * MINUTE_IN_SECONDS,
             'max_queue'        => 50,
             'load_limit'       => 4.0,
+            'stale_refresh_days'    => 14,
+            'stale_scan_batch'      => 4,
+            'stale_scan_file_limit' => 500,
+            'stale_scan_interval'   => 6 * HOUR_IN_SECONDS,
         ),
     );
 
@@ -180,6 +195,64 @@ function anchor_cache_governor_get_ttl_days() {
     return max( 1, min( 365, $days ) );
 }
 
+function anchor_cache_governor_get_stale_refresh_days() {
+    $profile = anchor_cache_governor_get_profile();
+    $days    = defined( 'ANCHOR_CACHE_GOVERNOR_STALE_REFRESH_DAYS' )
+        ? (int) ANCHOR_CACHE_GOVERNOR_STALE_REFRESH_DAYS
+        : (int) ( $profile['stale_refresh_days'] ?? 14 );
+
+    /**
+     * Filters the age after which cached HTML is eligible for slow refresh.
+     *
+     * @param int $days Cache file age in days.
+     */
+    $days = (int) apply_filters( 'anchor_cache_governor_stale_refresh_days', $days );
+
+    return max( 1, min( 365, $days ) );
+}
+
+function anchor_cache_governor_get_stale_scan_batch() {
+    $profile = anchor_cache_governor_get_profile();
+    $batch   = (int) ( $profile['stale_scan_batch'] ?? 4 );
+
+    /**
+     * Filters how many stale cached URLs may be queued per scanner pass.
+     *
+     * @param int $batch URL count.
+     */
+    $batch = (int) apply_filters( 'anchor_cache_governor_stale_scan_batch', $batch );
+
+    return max( 1, min( 25, $batch ) );
+}
+
+function anchor_cache_governor_get_stale_scan_file_limit() {
+    $profile = anchor_cache_governor_get_profile();
+    $limit   = (int) ( $profile['stale_scan_file_limit'] ?? 500 );
+
+    /**
+     * Filters how many WP-Optimize cache files Anchor may inspect per scan.
+     *
+     * @param int $limit File count.
+     */
+    $limit = (int) apply_filters( 'anchor_cache_governor_stale_scan_file_limit', $limit );
+
+    return max( 50, min( 5000, $limit ) );
+}
+
+function anchor_cache_governor_get_stale_scan_interval() {
+    $profile  = anchor_cache_governor_get_profile();
+    $interval = (int) ( $profile['stale_scan_interval'] ?? ( 6 * HOUR_IN_SECONDS ) );
+
+    /**
+     * Filters the delay between conservative stale-cache scanner passes.
+     *
+     * @param int $interval Delay in seconds.
+     */
+    $interval = (int) apply_filters( 'anchor_cache_governor_stale_scan_interval', $interval );
+
+    return max( HOUR_IN_SECONDS, min( WEEK_IN_SECONDS, $interval ) );
+}
+
 function anchor_cache_governor_apply_wpo_conservative_profile() {
     if ( ! anchor_cache_governor_is_wp_optimize_active() ) {
         return array(
@@ -215,6 +288,10 @@ function anchor_cache_governor_apply_wpo_conservative_profile() {
     $cleared = anchor_cache_governor_clear_wpo_preload_jobs();
 
     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_LAST_ENFORCED, time(), false );
+
+    if ( anchor_cache_governor_is_enabled() ) {
+        anchor_cache_governor_schedule_stale_scan( HOUR_IN_SECONDS );
+    }
 
     return array(
         'ok'      => true,
@@ -290,6 +367,34 @@ function anchor_cache_governor_update_warm_stats( array $stats ) {
     update_option(
         ANCHOR_CACHE_GOVERNOR_OPTION_WARM_STATS,
         array_merge( anchor_cache_governor_get_warm_stats(), $stats ),
+        false
+    );
+}
+
+function anchor_cache_governor_get_stale_scan_stats() {
+    $stats = get_option( ANCHOR_CACHE_GOVERNOR_OPTION_STALE_STATS, array() );
+    if ( ! is_array( $stats ) ) {
+        $stats = array();
+    }
+
+    return array_merge(
+        array(
+            'last_run'           => 0,
+            'last_error'         => '',
+            'last_root'          => '',
+            'last_scanned_files' => 0,
+            'last_found_count'   => 0,
+            'last_enqueued'      => 0,
+            'last_cutoff'        => 0,
+        ),
+        $stats
+    );
+}
+
+function anchor_cache_governor_update_stale_scan_stats( array $stats ) {
+    update_option(
+        ANCHOR_CACHE_GOVERNOR_OPTION_STALE_STATS,
+        array_merge( anchor_cache_governor_get_stale_scan_stats(), $stats ),
         false
     );
 }
@@ -519,6 +624,211 @@ function anchor_cache_governor_schedule_warm_runner( $delay = null ) {
     wp_schedule_single_event( time() + max( 30, (int) $delay ), ANCHOR_CACHE_GOVERNOR_WARM_HOOK );
 }
 
+function anchor_cache_governor_get_wpo_cache_root() {
+    if ( ! defined( 'WP_CONTENT_DIR' ) ) {
+        return '';
+    }
+
+    $root = trailingslashit( WP_CONTENT_DIR ) . 'cache/wpo-cache';
+
+    /**
+     * Filters the WP-Optimize page-cache root scanned by Anchor.
+     *
+     * @param string $root Cache root path.
+     */
+    $root = (string) apply_filters( 'anchor_cache_governor_wpo_cache_root', $root );
+    $root = untrailingslashit( $root );
+
+    return '' !== $root ? $root : '';
+}
+
+function anchor_cache_governor_hosts_match( $candidate_host ) {
+    $home_host = wp_parse_url( home_url(), PHP_URL_HOST );
+    if ( ! is_string( $home_host ) || '' === $home_host ) {
+        return false;
+    }
+
+    $home_host      = strtolower( preg_replace( '/^www\./', '', $home_host ) );
+    $candidate_host = strtolower( preg_replace( '/^www\./', '', (string) $candidate_host ) );
+
+    return '' !== $candidate_host && $candidate_host === $home_host;
+}
+
+function anchor_cache_governor_cache_file_to_url( $file, $root = '' ) {
+    $root = '' !== $root ? $root : anchor_cache_governor_get_wpo_cache_root();
+    if ( '' === $root ) {
+        return '';
+    }
+
+    $real_root = realpath( $root );
+    $real_file = realpath( (string) $file );
+    if ( ! is_string( $real_root ) || ! is_string( $real_file ) ) {
+        return '';
+    }
+
+    $real_root = rtrim( str_replace( '\\', '/', $real_root ), '/' );
+    $real_file = str_replace( '\\', '/', $real_file );
+
+    if ( 0 !== strpos( $real_file, $real_root . '/' ) ) {
+        return '';
+    }
+
+    $relative = ltrim( substr( $real_file, strlen( $real_root ) ), '/' );
+    $parts    = array_values( array_filter( explode( '/', $relative ), 'strlen' ) );
+    if ( count( $parts ) < 2 ) {
+        return '';
+    }
+
+    $host = array_shift( $parts );
+    if ( ! anchor_cache_governor_hosts_match( $host ) ) {
+        return '';
+    }
+
+    $file_name = (string) end( $parts );
+    if ( ! preg_match( '/\.html?$/i', $file_name ) ) {
+        return '';
+    }
+
+    if ( preg_match( '/^index\.html?$/i', $file_name ) ) {
+        array_pop( $parts );
+    } else {
+        $parts[ count( $parts ) - 1 ] = preg_replace( '/\.html?$/i', '', $file_name );
+    }
+
+    $path = implode( '/', array_map( 'rawurlencode', $parts ) );
+    $url  = home_url( '' === $path ? '/' : '/' . $path . '/' );
+
+    /**
+     * Filters the URL mapped from a WP-Optimize cache file.
+     *
+     * @param string $url  Candidate URL.
+     * @param string $file Cache file path.
+     * @param string $root Cache root path.
+     */
+    $url = (string) apply_filters( 'anchor_cache_governor_cache_file_url', $url, $file, $root );
+
+    return anchor_cache_governor_normalize_url( $url );
+}
+
+function anchor_cache_governor_find_stale_wpo_cache_urls( $limit = null ) {
+    $root = anchor_cache_governor_get_wpo_cache_root();
+    if ( '' === $root || ! is_dir( $root ) ) {
+        return array(
+            'ok'            => false,
+            'message'       => 'WP-Optimize cache root was not found.',
+            'root'          => $root,
+            'scanned_files' => 0,
+            'urls'          => array(),
+        );
+    }
+
+    $limit      = null === $limit ? anchor_cache_governor_get_stale_scan_batch() : (int) $limit;
+    $limit      = max( 1, min( 25, $limit ) );
+    $file_limit = anchor_cache_governor_get_stale_scan_file_limit();
+    $cutoff     = time() - ( anchor_cache_governor_get_stale_refresh_days() * DAY_IN_SECONDS );
+    $candidates = array();
+    $seen       = array();
+    $scanned    = 0;
+
+    try {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $root, FilesystemIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::LEAVES_ONLY
+        );
+
+        foreach ( $iterator as $file_info ) {
+            if ( $scanned >= $file_limit ) {
+                break;
+            }
+
+            if ( ! $file_info instanceof SplFileInfo || ! $file_info->isFile() ) {
+                continue;
+            }
+
+            $path = $file_info->getPathname();
+            if ( ! preg_match( '/\.html?$/i', $path ) ) {
+                continue;
+            }
+
+            $scanned++;
+            $mtime = (int) $file_info->getMTime();
+            if ( $mtime <= 0 || $mtime > $cutoff ) {
+                continue;
+            }
+
+            $url = anchor_cache_governor_cache_file_to_url( $path, $root );
+            if ( '' === $url || isset( $seen[ $url ] ) ) {
+                continue;
+            }
+
+            $diagnosis = anchor_cache_governor_diagnose_url( $url );
+            if ( empty( $diagnosis['cacheable'] ) ) {
+                continue;
+            }
+
+            $seen[ $url ] = true;
+            $candidates[] = array(
+                'url'   => $url,
+                'mtime' => $mtime,
+            );
+        }
+    } catch ( Exception $e ) {
+        return array(
+            'ok'            => false,
+            'message'       => $e->getMessage(),
+            'root'          => $root,
+            'scanned_files' => $scanned,
+            'urls'          => array(),
+        );
+    }
+
+    usort(
+        $candidates,
+        function( $a, $b ) {
+            return (int) $a['mtime'] <=> (int) $b['mtime'];
+        }
+    );
+
+    $urls = array();
+    foreach ( array_slice( $candidates, 0, $limit ) as $candidate ) {
+        $urls[] = (string) $candidate['url'];
+    }
+
+    return array(
+        'ok'            => true,
+        'message'       => 'Stale WP-Optimize cache scan completed.',
+        'root'          => $root,
+        'cutoff'        => $cutoff,
+        'scanned_files' => $scanned,
+        'found_count'   => count( $candidates ),
+        'urls'          => $urls,
+    );
+}
+
+function anchor_cache_governor_schedule_stale_scan( $delay = null ) {
+    if ( ! anchor_cache_governor_is_enabled() || ! anchor_cache_governor_is_wp_optimize_active() ) {
+        return false;
+    }
+
+    if ( wp_next_scheduled( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK ) ) {
+        return false;
+    }
+
+    if ( null === $delay ) {
+        $delay = anchor_cache_governor_get_stale_scan_interval();
+    }
+
+    return (bool) wp_schedule_single_event(
+        time() + max( 5 * MINUTE_IN_SECONDS, (int) $delay ),
+        ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK
+    );
+}
+
+function anchor_cache_governor_maybe_schedule_stale_scan() {
+    anchor_cache_governor_schedule_stale_scan();
+}
+add_action( 'init', 'anchor_cache_governor_maybe_schedule_stale_scan', 25 );
+
 function anchor_cache_governor_server_too_busy() {
     if ( ! function_exists( 'sys_getloadavg' ) ) {
         return false;
@@ -534,6 +844,71 @@ function anchor_cache_governor_server_too_busy() {
 
     return $limit > 0 && (float) $load[0] > $limit;
 }
+
+function anchor_cache_governor_run_stale_scan( $manual = false ) {
+    if ( ! anchor_cache_governor_is_enabled() || ! anchor_cache_governor_is_wp_optimize_active() ) {
+        return array(
+            'ok'      => false,
+            'message' => 'Cache Governor must be enabled and WP-Optimize must be active before stale cache scanning.',
+        );
+    }
+
+    if ( get_transient( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_LOCK ) ) {
+        return array(
+            'ok'      => false,
+            'message' => 'Stale cache scanner is already active.',
+        );
+    }
+
+    if ( ! $manual && anchor_cache_governor_server_too_busy() ) {
+        anchor_cache_governor_schedule_stale_scan();
+        return array(
+            'ok'      => false,
+            'message' => 'Server load is above the stale scan threshold.',
+        );
+    }
+
+    set_transient( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_LOCK, 1, 5 * MINUTE_IN_SECONDS );
+
+    $scan = anchor_cache_governor_find_stale_wpo_cache_urls();
+    $queued = array(
+        'added'        => 0,
+        'queue_length' => count( anchor_cache_governor_get_warm_queue() ),
+        'max_queue'    => (int) ( anchor_cache_governor_get_profile()['max_queue'] ?? 0 ),
+    );
+
+    if ( ! empty( $scan['ok'] ) && ! empty( $scan['urls'] ) && is_array( $scan['urls'] ) ) {
+        $queued = anchor_cache_governor_enqueue_warm_urls( $scan['urls'], 'stale-scan' );
+    }
+
+    $error = empty( $scan['ok'] ) ? (string) ( $scan['message'] ?? 'Stale cache scan failed.' ) : '';
+    anchor_cache_governor_update_stale_scan_stats(
+        array(
+            'last_run'           => time(),
+            'last_error'         => $error,
+            'last_root'          => (string) ( $scan['root'] ?? '' ),
+            'last_scanned_files' => (int) ( $scan['scanned_files'] ?? 0 ),
+            'last_found_count'   => (int) ( $scan['found_count'] ?? 0 ),
+            'last_enqueued'      => (int) ( $queued['added'] ?? 0 ),
+            'last_cutoff'        => (int) ( $scan['cutoff'] ?? 0 ),
+        )
+    );
+
+    delete_transient( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_LOCK );
+    anchor_cache_governor_schedule_stale_scan();
+
+    return array(
+        'ok'      => ! empty( $scan['ok'] ),
+        'message' => (string) ( $scan['message'] ?? '' ),
+        'scan'    => $scan,
+        'queued'  => $queued,
+    );
+}
+
+function anchor_cache_governor_stale_scan_cron_runner() {
+    anchor_cache_governor_run_stale_scan( false );
+}
+add_action( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK, 'anchor_cache_governor_stale_scan_cron_runner' );
 
 function anchor_cache_governor_run_warm_step( $manual = false ) {
     if ( ! anchor_cache_governor_is_enabled() || ! anchor_cache_governor_is_wp_optimize_active() ) {
@@ -712,6 +1087,7 @@ function anchor_cache_governor_get_diagnostics() {
     $profile     = anchor_cache_governor_get_profile();
     $queue       = anchor_cache_governor_get_warm_queue();
     $warm_stats  = anchor_cache_governor_get_warm_stats();
+    $stale_stats = anchor_cache_governor_get_stale_scan_stats();
 
     $ttl_seconds = isset( $config['page_cache_length'] ) ? (int) $config['page_cache_length'] : 0;
     if ( $ttl_seconds <= 0 && isset( $config['page_cache_length_value'], $config['page_cache_length_unit'] ) ) {
@@ -748,6 +1124,16 @@ function anchor_cache_governor_get_diagnostics() {
             'next_scheduled' => (int) wp_next_scheduled( ANCHOR_CACHE_GOVERNOR_WARM_HOOK ),
             'stats'         => $warm_stats,
         ),
+        'stale_scan'          => array(
+            'next_scheduled'     => (int) wp_next_scheduled( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK ),
+            'stale_refresh_days' => anchor_cache_governor_get_stale_refresh_days(),
+            'batch'              => anchor_cache_governor_get_stale_scan_batch(),
+            'file_limit'         => anchor_cache_governor_get_stale_scan_file_limit(),
+            'interval_seconds'   => anchor_cache_governor_get_stale_scan_interval(),
+            'root'               => anchor_cache_governor_get_wpo_cache_root(),
+            'root_exists'        => is_dir( anchor_cache_governor_get_wpo_cache_root() ),
+            'stats'              => $stale_stats,
+        ),
     );
 
     $risks = array();
@@ -779,6 +1165,13 @@ function anchor_cache_governor_get_diagnostics() {
 
     if ( $diagnostics['ttl_seconds'] > 0 && $diagnostics['ttl_seconds'] < WEEK_IN_SECONDS ) {
         $risks[] = 'Cache lifespan is shorter than one week.';
+    }
+
+    if (
+        $diagnostics['ttl_seconds'] > 0
+        && $diagnostics['stale_scan']['stale_refresh_days'] * DAY_IN_SECONDS >= $diagnostics['ttl_seconds']
+    ) {
+        $risks[] = 'Stale refresh age is not earlier than the WP-Optimize cache lifespan.';
     }
 
     $diagnostics['risks'] = $risks;
@@ -865,6 +1258,7 @@ function anchor_cache_governor_rest_disable( WP_REST_Request $request ) {
     unset( $request );
 
     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
+    wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK );
 
     return rest_ensure_response(
         array(
@@ -959,6 +1353,20 @@ function anchor_cache_governor_rest_run_warm_step( WP_REST_Request $request ) {
     );
 }
 
+function anchor_cache_governor_rest_scan_stale_cache( WP_REST_Request $request ) {
+    unset( $request );
+
+    $result = anchor_cache_governor_run_stale_scan( true );
+
+    return rest_ensure_response(
+        array(
+            'ok'          => ! empty( $result['ok'] ),
+            'result'      => $result,
+            'diagnostics' => anchor_cache_governor_get_diagnostics(),
+        )
+    );
+}
+
 function anchor_cache_governor_rest_diagnose_url( WP_REST_Request $request ) {
     $url = $request->get_param( 'url' );
 
@@ -997,7 +1405,7 @@ function anchor_cache_governor_register_rest_routes() {
         )
     );
 
-    foreach ( array( 'enable', 'disable', 'apply-wpo-profile', 'clear-wpo-preload', 'set-profile', 'enqueue-default-warm', 'run-warm-step' ) as $action ) {
+    foreach ( array( 'enable', 'disable', 'apply-wpo-profile', 'clear-wpo-preload', 'set-profile', 'enqueue-default-warm', 'run-warm-step', 'scan-stale-cache' ) as $action ) {
         register_rest_route(
             'anchor/v1',
             '/cache-governor/' . $action,
@@ -1077,6 +1485,23 @@ function anchor_cache_governor_handle_admin_action( $posted_action ) {
             );
             break;
 
+        case 'cache_governor_scan_stale_cache':
+            $result = anchor_cache_governor_run_stale_scan( true );
+            $queued = is_array( $result['queued'] ?? null ) ? $result['queued'] : array();
+            $scan   = is_array( $result['scan'] ?? null ) ? $result['scan'] : array();
+            $notices[] = array(
+                'type'    => ! empty( $result['ok'] ) ? 'success' : 'error',
+                'message' => ! empty( $result['ok'] )
+                    ? sprintf(
+                        'Stale cache scan checked %1$d file(s), found %2$d stale URL(s), and queued %3$d.',
+                        (int) ( $scan['scanned_files'] ?? 0 ),
+                        (int) ( $scan['found_count'] ?? 0 ),
+                        (int) ( $queued['added'] ?? 0 )
+                    )
+                    : (string) ( $result['message'] ?? 'Stale cache scan failed.' ),
+            );
+            break;
+
         case 'cache_governor_diagnose_url':
             $url = isset( $_POST['anchor_cache_governor_diagnose_url'] )
                 ? esc_url_raw( wp_unslash( $_POST['anchor_cache_governor_diagnose_url'] ) )
@@ -1105,6 +1530,8 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
     $profiles = anchor_cache_governor_get_profiles();
     $warm = $diagnostics['warm_queue'];
     $warm_stats = is_array( $warm['stats'] ?? null ) ? $warm['stats'] : array();
+    $stale_scan = is_array( $diagnostics['stale_scan'] ?? null ) ? $diagnostics['stale_scan'] : array();
+    $stale_stats = is_array( $stale_scan['stats'] ?? null ) ? $stale_scan['stats'] : array();
 
     echo '<div class="anchor-section">';
     echo '<h2>Cache Governor</h2>';
@@ -1156,6 +1583,12 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
     echo '<input type="submit" class="button button-secondary" value="Run One Warm Step"' . $warm_disabled . '>';
     echo '</form>';
 
+    echo '<form method="post" action="" style="display:inline-block; margin-left: 12px;">';
+    wp_nonce_field( $nonce_action, $nonce_name );
+    echo '<input type="hidden" name="anchor_action" value="cache_governor_scan_stale_cache">';
+    echo '<input type="submit" class="button button-secondary" value="Scan Stale Cache"' . $warm_disabled . '>';
+    echo '</form>';
+
     if ( $diagnostics['wpo_active'] ) {
         echo '<table class="widefat striped" style="max-width: 900px; margin-top: 14px;">';
         echo '<tbody>';
@@ -1167,6 +1600,10 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
         echo '<tr><th scope="row">Queued WPO preload jobs</th><td>' . esc_html( (string) $diagnostics['preload_cron_count'] ) . '</td></tr>';
         echo '<tr><th scope="row">Anchor warm queue</th><td>' . esc_html( (string) ( $warm['length'] ?? 0 ) ) . '</td></tr>';
         echo '<tr><th scope="row">Anchor warm stats</th><td>' . esc_html( sprintf( 'Warmed: %1$d; failed: %2$d', (int) ( $warm_stats['warmed_count'] ?? 0 ), (int) ( $warm_stats['failed_count'] ?? 0 ) ) ) . '</td></tr>';
+        echo '<tr><th scope="row">Stale refresh threshold</th><td>' . esc_html( sprintf( '%d days', (int) ( $stale_scan['stale_refresh_days'] ?? 0 ) ) ) . '</td></tr>';
+        echo '<tr><th scope="row">Stale scan limits</th><td>' . esc_html( sprintf( 'Batch: %1$d URL(s); files per scan: %2$d', (int) ( $stale_scan['batch'] ?? 0 ), (int) ( $stale_scan['file_limit'] ?? 0 ) ) ) . '</td></tr>';
+        echo '<tr><th scope="row">Stale scan root</th><td><code>' . esc_html( (string) ( $stale_scan['root'] ?? '' ) ) . '</code> ' . esc_html( ! empty( $stale_scan['root_exists'] ) ? 'found' : 'not found yet' ) . '</td></tr>';
+        echo '<tr><th scope="row">Last stale scan</th><td>' . esc_html( sprintf( 'Checked: %1$d; found: %2$d; queued: %3$d', (int) ( $stale_stats['last_scanned_files'] ?? 0 ), (int) ( $stale_stats['last_found_count'] ?? 0 ), (int) ( $stale_stats['last_enqueued'] ?? 0 ) ) ) . '</td></tr>';
         if ( ! empty( $warm_stats['last_url'] ) ) {
             echo '<tr><th scope="row">Last warmed URL</th><td><code>' . esc_html( (string) $warm_stats['last_url'] ) . '</code> status ' . esc_html( (string) ( $warm_stats['last_status'] ?? 0 ) ) . '</td></tr>';
         }
@@ -1175,6 +1612,12 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
                 ? wp_date( 'Y-m-d H:i:s T', (int) $warm_stats['paused_until'] )
                 : date_i18n( 'Y-m-d H:i:s T', (int) $warm_stats['paused_until'] );
             echo '<tr><th scope="row">Warm queue paused until</th><td>' . esc_html( $pause_str ) . '</td></tr>';
+        }
+        if ( ! empty( $stale_scan['next_scheduled'] ) ) {
+            $next_scan_str = function_exists( 'wp_date' )
+                ? wp_date( 'Y-m-d H:i:s T', (int) $stale_scan['next_scheduled'] )
+                : date_i18n( 'Y-m-d H:i:s T', (int) $stale_scan['next_scheduled'] );
+            echo '<tr><th scope="row">Next stale scan</th><td>' . esc_html( $next_scan_str ) . '</td></tr>';
         }
         echo '</tbody></table>';
     }
@@ -1205,7 +1648,7 @@ function anchor_cache_governor_render_admin_section( $nonce_action, $nonce_name 
         echo '<div class="anchor-kv"><strong>Last governor enforcement:</strong> ' . esc_html( $last_str ) . '</div>';
     }
 
-    echo '<p style="max-width: 1100px;"><em>Notes:</em> Enabling the governor keeps WP-Optimize on a conservative profile: no preload-after-purge, no scheduled/sitemap preload, no separate mobile cache, and a longer cache lifespan. The Anchor warm queue handles one URL per run and backs off after failures. It does not replace WP-Optimize or enable page caching on sites where page caching is off.</p>';
+    echo '<p style="max-width: 1100px;"><em>Notes:</em> Enabling the governor keeps WP-Optimize on a conservative profile: no preload-after-purge, no scheduled/sitemap preload, no separate mobile cache, and a longer cache lifespan. The Anchor warm queue handles one URL per run and backs off after failures. The stale scanner only queues a small batch of older WP-Optimize HTML files for that same slow warm queue. It does not replace WP-Optimize or enable page caching on sites where page caching is off.</p>';
     echo '</div>';
 }
 
@@ -1285,6 +1728,13 @@ if ( defined( 'WP_CLI' ) && WP_CLI && class_exists( 'WP_CLI_Command' ) ) {
          */
         public function run_warm_step() {
             $this->print_json( anchor_cache_governor_run_warm_step( true ) );
+        }
+
+        /**
+         * Scan WP-Optimize cache files and queue stale URLs for slow warming.
+         */
+        public function scan_stale_cache() {
+            $this->print_json( anchor_cache_governor_run_stale_scan( true ) );
         }
 
         /**

@@ -1,0 +1,9 @@
+# Local live-site automation artifacts.
+.*-cookies.txt
+.*-login*.html
+.*-plugins.html
+.*-upgrade.html
+.*-activate.html
+.*-logout*.html
+.anchor-live-*
+.embclife-*

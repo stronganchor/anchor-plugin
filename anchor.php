@@ -4,7 +4,7 @@
  * Plugin URI: https://stronganchortech.com
  * Description: Custom tools for managing Strong Anchor Tech's WordPress sites
  * Author: Strong Anchor Tech
- * Version: 1.2.7
+ * Version: 1.2.8
  * Update URI: https://github.com/stronganchor/anchor-plugin
  */
 
@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 if ( ! defined( 'ANCHOR_VERSION' ) ) {
-    define( 'ANCHOR_VERSION', '1.2.7' );
+    define( 'ANCHOR_VERSION', '1.2.8' );
 }
 
 if ( ! defined( 'ANCHOR_SELF_UPDATE_WAS_ACTIVE_OPTION' ) ) {
@@ -311,6 +311,7 @@ function anchor_admin_page() {
 
                 if ( $enabled ) {
                     update_option( ANCHOR_CACHE_GOVERNOR_OPTION_ENABLED, '0', false );
+                    wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK );
                     $notices[] = array(
                         'type'    => 'success',
                         'message' => 'Cache Governor has been disabled.',
@@ -353,6 +354,7 @@ function anchor_admin_page() {
             case 'cache_governor_save_profile':
             case 'cache_governor_enqueue_default_warm':
             case 'cache_governor_run_warm_step':
+            case 'cache_governor_scan_stale_cache':
             case 'cache_governor_diagnose_url':
                 $notices = array_merge( $notices, anchor_cache_governor_handle_admin_action( $posted_action ) );
                 break;
@@ -741,6 +743,9 @@ function anchor_deactivate() {
     anchor_temp_admin_unschedule_cleanup();
     if ( defined( 'ANCHOR_CACHE_GOVERNOR_WARM_HOOK' ) ) {
         wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_WARM_HOOK );
+    }
+    if ( defined( 'ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK' ) ) {
+        wp_clear_scheduled_hook( ANCHOR_CACHE_GOVERNOR_STALE_SCAN_HOOK );
     }
     delete_option( 'anchor_error_reporting_enabled' );
     delete_option( 'anchor_disable_pings_enabled' );
